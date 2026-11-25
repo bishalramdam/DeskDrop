@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+*.app
+mac/.build/
+mac/.swiftpm/
+*.xcuserdata
+*.xcworkspace/xcuserdata/
+
+# Android / Gradle
+android/.gradle/
+android/local.properties
+android/.idea/
+android/build/
+android/app/build/
+android/*.iml
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Env / Secrets
+.env
+.env.*
