@@ -12,15 +12,18 @@ final class DropServer: @unchecked Sendable {
     private var activeSessions: [ObjectIdentifier: HTTPConnectionSession] = [:]
     private let preferredPort: UInt16
     private let onReceive: @Sendable (DropPayload) async -> Bool
+    private let onActivity: @Sendable () -> Void
     private let onStatusChange: @Sendable (UInt16?, String?) -> Void
 
     init(
         preferredPort: UInt16 = 51234,
         onStatusChange: @escaping @Sendable (UInt16?, String?) -> Void,
+        onActivity: @escaping @Sendable () -> Void = {},
         onReceive: @escaping @Sendable (DropPayload) async -> Bool
     ) {
         self.preferredPort = preferredPort
         self.onStatusChange = onStatusChange
+        self.onActivity = onActivity
         self.onReceive = onReceive
     }
 
@@ -32,6 +35,10 @@ final class DropServer: @unchecked Sendable {
     func stop() {
         listener?.cancel()
         listener = nil
+        for session in activeSessions.values {
+            session.forceClose()
+        }
+        activeSessions.removeAll()
         onStatusChange(nil, nil)
     }
 
@@ -76,6 +83,7 @@ final class DropServer: @unchecked Sendable {
     }
 
     private func handleConnection(_ connection: NWConnection) {
+        onActivity()
         connection.start(queue: queue)
         let session = HTTPConnectionSession(
             connection: connection,
@@ -270,6 +278,11 @@ private final class HTTPConnectionSession: @unchecked Sendable {
         connection.send(content: packet, completion: .contentProcessed { [weak self] _ in
             self?.close()
         })
+    }
+
+    func forceClose() {
+        handled = true
+        close()
     }
 
     private func close() {

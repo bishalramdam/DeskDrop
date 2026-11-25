@@ -1,6 +1,7 @@
 package com.bishal.deskdrop
 
 import android.os.Bundle
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -15,6 +16,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var hostInput: EditText
     private lateinit var portInput: EditText
     private lateinit var quickTextInput: EditText
+    private lateinit var disconnectButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -24,11 +26,13 @@ class MainActivity : AppCompatActivity() {
         hostInput = findViewById(R.id.hostInput)
         portInput = findViewById(R.id.portInput)
         quickTextInput = findViewById(R.id.quickTextInput)
+        disconnectButton = findViewById(R.id.disconnectButton)
 
         DeskDropPrefs.getTarget(this)?.let { saved ->
             hostInput.setText(saved.host)
             portInput.setText(saved.port.toString())
             statusText.text = "Saved: ${saved.name} (${saved.host}:${saved.port})"
+            disconnectButton.visibility = View.VISIBLE
         }
 
         findViewById<Button>(R.id.scanButton).setOnClickListener {
@@ -37,6 +41,15 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.saveTestButton).setOnClickListener {
             saveAndPing()
+        }
+
+        disconnectButton.setOnClickListener {
+            DeskDropPrefs.clearTarget(this)
+            hostInput.setText("")
+            portInput.setText("51234")
+            statusText.text = "Disconnected. Tap Auto-Find Mac to pair on Wi-Fi"
+            disconnectButton.visibility = View.GONE
+            Toast.makeText(this, "Disconnected", Toast.LENGTH_SHORT).show()
         }
 
         findViewById<Button>(R.id.sendTextButton).setOnClickListener {
@@ -54,6 +67,7 @@ class MainActivity : AppCompatActivity() {
                     hostInput.setText(found.host)
                     portInput.setText(found.port.toString())
                     statusText.text = "Connected: ${found.name} (${found.host}:${found.port})"
+                    disconnectButton.visibility = View.VISIBLE
                     Toast.makeText(this, "Found ${found.name}", Toast.LENGTH_SHORT).show()
                 } else {
                     statusText.text = "No Mac found via Bonjour. Enter IP manually or check Wi-Fi."
@@ -77,6 +91,7 @@ class MainActivity : AppCompatActivity() {
                 if (verified != null) {
                     DeskDropPrefs.saveTarget(this, verified)
                     statusText.text = "Connected: ${verified.name} (${verified.host}:${verified.port})"
+                    disconnectButton.visibility = View.VISIBLE
                     Toast.makeText(this, "Connected to ${verified.name}!", Toast.LENGTH_SHORT).show()
                 } else {
                     statusText.text = "Could not reach DeskDrop at $host:$port"

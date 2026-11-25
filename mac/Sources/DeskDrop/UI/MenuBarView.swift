@@ -24,12 +24,16 @@ struct MenuBarView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(store.listeningPort != nil ? Color.green : Color.red)
+                        .fill(store.isListening ? (store.listeningPort != nil ? Color.green : Color.orange) : Color.secondary)
                         .frame(width: 8, height: 8)
                     Text("DeskDrop")
                         .font(.headline)
                 }
-                if let port = store.listeningPort {
+                if !store.isListening {
+                    Text(store.statusNote ?? "Stopped")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let port = store.listeningPort {
                     let ips = NetworkUtils.localIPv4Addresses()
                     let addressText = ips.first.map { "\($0):\(port)" } ?? "localhost:\(port)"
                     Text("Listening on \(addressText) (Bonjour)")
@@ -47,19 +51,21 @@ struct MenuBarView: View {
                 }
             }
             Spacer()
-            Button {
-                store.openReceivedFolder()
-            } label: {
-                Image(systemName: "folder")
+            Button(store.isListening ? "Stop" : "Start") {
+                store.toggleListening()
             }
-            .buttonStyle(.borderless)
-            .help("Open Received Folder")
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(store.isListening ? .red : .accentColor)
         }
     }
 
     private var controlsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Auto-copy to Clipboard", isOn: $store.autoCopyToClipboard)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            Toggle("Auto-stop after 2m idle", isOn: $store.autoStopOnIdle)
                 .toggleStyle(.switch)
                 .controlSize(.small)
             Toggle("Bluetooth Nearby Beacon", isOn: $store.bleBeaconEnabled)

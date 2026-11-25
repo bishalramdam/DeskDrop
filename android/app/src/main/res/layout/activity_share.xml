@@ -3,15 +3,18 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="24dp">
+    android:padding="28dp">
 
     <com.google.android.material.card.MaterialCardView
+        style="@style/Widget.Material3.CardView.Elevated"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
-        app:cardCornerRadius="20dp"
-        app:cardElevation="8dp"
-        app:contentPadding="20dp">
+        app:cardCornerRadius="24dp"
+        app:cardElevation="6dp"
+        app:contentPadding="24dp"
+        app:strokeColor="@color/card_stroke"
+        app:strokeWidth="1dp">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -21,17 +24,17 @@
 
             <ProgressBar
                 android:id="@+id/shareProgress"
-                android:layout_width="36dp"
-                android:layout_height="36dp" />
+                android:layout_width="32dp"
+                android:layout_height="32dp" />
 
             <TextView
                 android:id="@+id/shareTitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
+                android:layout_marginTop="14dp"
+                android:fontFamily="sans-serif-medium"
                 android:text="Sending to Mac..."
-                android:textSize="17sp"
-                android:textStyle="bold" />
+                android:textSize="17sp" />
 
             <TextView
                 android:id="@+id/shareSubtitle"
@@ -48,9 +51,10 @@
                 style="@style/Widget.Material3.Button.TonalButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
+                android:layout_marginTop="14dp"
                 android:text="Retry"
-                android:visibility="gone" />
+                android:visibility="gone"
+                app:cornerRadius="24dp" />
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 </FrameLayout>

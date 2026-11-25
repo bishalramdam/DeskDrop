@@ -17,6 +17,10 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp ".build/release/DeskDrop" "$MACOS_DIR/DeskDrop"
 cp "Info.plist" "$CONTENTS_DIR/Info.plist"
+if [ ! -f "Resources/AppIcon.icns" ]; then
+    swift "scripts/generate_icon.swift" "Resources/AppIcon.icns"
+fi
+cp "Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 
 # Ad-hoc sign so macOS local network & notification permissions behave consistently
 codesign --force --deep --sign - "$APP_DIR"

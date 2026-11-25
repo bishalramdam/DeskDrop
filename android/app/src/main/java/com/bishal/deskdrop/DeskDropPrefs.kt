@@ -31,4 +31,13 @@ object DeskDropPrefs {
             .putString(KEY_NAME, target.name)
             .apply()
     }
+
+    fun clearTarget(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_HOST)
+            .remove(KEY_PORT)
+            .remove(KEY_NAME)
+            .apply()
+    }
 }
