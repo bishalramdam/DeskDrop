@@ -1,0 +1,99 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    name: Build macOS App
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build DeskDrop.app
+        run: |
+          chmod +x mac/build_app.sh
+          ./mac/build_app.sh
+          ditto -c -k --sequesterRsrc --keepParent mac/build/DeskDrop.app DeskDrop-macOS.zip
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskDrop-macOS
+          path: DeskDrop-macOS.zip
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Build Debug APK
+        run: |
+          gradle -p android assembleDebug
+          cp android/app/build/outputs/apk/debug/app-debug.apk DeskDrop-android.apk
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskDrop-android
+          path: DeskDrop-android.apk
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-mac, build-android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DeskDrop-macOS
+
+      - name: Download Android Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DeskDrop-android
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## DeskDrop ${{ github.ref_name }}
+
+            Encrypted, local-network-only sharing from Android's Share Sheet directly to your Mac clipboard & menu bar.
+
+            ### Highlights
+            - **Zero background battery drain on Android:** Sends directly from the native Android Share Sheet (`Send to Mac`) and auto-closes.
+            - **Maximum local security:** HTTPS (SwiftNIO SSL / BoringSSL) with SHA-256 certificate pinning, 1-time QR or 6-digit pairing, `HMAC-SHA256` request signing with replay protection, and AndroidKeyStore AES-256-GCM token storage.
+            - **Smart Mac lifecycle:** Auto-pauses when your Mac locks or sleeps, optional Trusted Wi-Fi SSID allowlist, and instant device revocation (auto-unpairs on phone).
+            - **Native Mac integration:** Auto-copies screenshots, images, and text to your clipboard, saves files to `~/Library/Application Support/DeskDrop/Received/`, and delivers native macOS notifications with **Copy**, **Copy Path**, and **Show in Finder** actions.
+
+            ### Downloads
+            - `DeskDrop-macOS.zip` — Unzip and move `DeskDrop.app` into `~/Applications/` or `/Applications/`.
+            - `DeskDrop-android.apk` — Install on Android 8.0+ (API 26+).
+          files: |
+            DeskDrop-macOS.zip
+            DeskDrop-android.apk
