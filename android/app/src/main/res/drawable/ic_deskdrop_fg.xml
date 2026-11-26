@@ -1,16 +1,42 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Downward tray & arrow matching Mac menu bar icon -->
-    <group
-        android:translateX="30"
-        android:translateY="30"
-        android:scaleX="2.0"
-        android:scaleY="2.0">
-        <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M12,4a1,1 0,0 1,1 1v6.59l2.3,-2.3a1,1 0,1 1,1.4 1.42l-4,4a1,1 0,0 1,-1.4 0l-4,-4a1,1 0,1 1,1.4 -1.42L11,11.59V5a1,1 0,0 1,1 -1zM5,15a1,1 0,0 1,1 1v2h12v-2a1,1 0,1 1,2 0v2a2,2 0,0 1,-2 2H6a2,2 0,0 1,-2 -2v-2a1,1 0,0 1,1 -1z" />
-    </group>
+
+    <!-- Back Card (Desk / Mac) -->
+    <path
+        android:pathData="M49,47 L73,47 A6,6 0 0,1 79,53 L79,72 A6,6 0 0,1 73,78 L49,78 A6,6 0 0,1 43,72 L43,53 A6,6 0 0,1 49,47 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="79"
+                android:endY="78"
+                android:startX="43"
+                android:startY="47"
+                android:type="linear">
+                <item android:color="#FFFFFFFF" android:offset="0.0" />
+                <item android:color="#FFDCE6F5" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Front Card (Phone / Clip - Translucent Blue Glass) -->
+    <path
+        android:pathData="M35,29 L53,29 A6,6 0 0,1 59,35 L59,59 A6,6 0 0,1 53,65 L35,65 A6,6 0 0,1 29,59 L29,35 A6,6 0 0,1 35,29 Z"
+        android:strokeColor="#80FFFFFF"
+        android:strokeWidth="1.2">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="59"
+                android:endY="65"
+                android:startX="29"
+                android:startY="29"
+                android:type="linear">
+                <item android:color="#E060A5FA" android:offset="0.0" />
+                <item android:color="#E82563EB" android:offset="0.55" />
+                <item android:color="#F01A69E0" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
 </vector>

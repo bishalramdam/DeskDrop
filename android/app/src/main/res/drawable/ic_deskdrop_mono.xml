@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Back Card (L-shaped visible portion leaving clean gap around front card) -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M62.5,47 L73,47 A6,6 0 0,1 79,53 L79,72 A6,6 0 0,1 73,78 L49,78 A6,6 0 0,1 43,72 L43,68.5 L55.5,68.5 A7,7 0 0,0 62.5,61.5 Z" />
+
+    <!-- Front Card -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M35,29 L53,29 A6,6 0 0,1 59,35 L59,59 A6,6 0 0,1 53,65 L35,65 A6,6 0 0,1 29,59 L29,35 A6,6 0 0,1 35,29 Z" />
+</vector>
