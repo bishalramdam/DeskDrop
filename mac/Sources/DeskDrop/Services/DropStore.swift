@@ -10,36 +10,48 @@ final class DropStore: NSObject, ObservableObject {
     @Published var isListening = false
     @Published var statusNote: String?
 
+    @Published var pairedDevices: [PairedDevice] = []
+    @Published var activePairingCode: String?
+    @Published var pairingSecondsLeft: Int = 0
+    @Published var pairingQRImage: NSImage?
+    @Published var shortFingerprint: String = ""
+
     @Published var autoCopyToClipboard: Bool {
         didSet { UserDefaults.standard.set(autoCopyToClipboard, forKey: "autoCopyToClipboard") }
     }
-    @Published var bleBeaconEnabled: Bool {
+    @Published var pauseOnLockSleep: Bool {
         didSet {
-            UserDefaults.standard.set(bleBeaconEnabled, forKey: "bleBeaconEnabled")
-            if bleBeaconEnabled && isListening {
-                bleBeacon.start()
-            } else {
-                bleBeacon.stop()
-            }
+            UserDefaults.standard.set(pauseOnLockSleep, forKey: "pauseOnLockSleep")
+            evaluateLifecycle()
         }
     }
-    @Published var autoStopOnIdle: Bool {
+    @Published var trustedWiFiOnly: Bool {
         didSet {
-            UserDefaults.standard.set(autoStopOnIdle, forKey: "autoStopOnIdle")
-            if autoStopOnIdle && isListening {
-                resetIdleTimer()
-            } else {
-                idleTimerTask?.cancel()
+            UserDefaults.standard.set(trustedWiFiOnly, forKey: "trustedWiFiOnly")
+            if trustedWiFiOnly {
+                wifiMonitor.requestLocationAccessIfNeeded()
             }
+            evaluateLifecycle()
+        }
+    }
+    @Published var trustedSSIDs: [String] {
+        didSet {
+            UserDefaults.standard.set(trustedSSIDs, forKey: "trustedSSIDs")
+            evaluateLifecycle()
         }
     }
 
     let storage = DropStorage()
-    private let bleBeacon = BLEBeacon()
+    let wifiMonitor = WiFiMonitor()
+    private let authManager = AuthManager()
+    private var tlsBundle: TLSIdentityBundle?
     private var server: DropServer?
-    private var idleTimerTask: Task<Void, Never>?
+    private var pairingTimerTask: Task<Void, Never>?
 
-    private static let idleTimeoutSeconds: UInt64 = 120 // 2 minutes
+    private var manuallyStopped = false
+    private var isScreenLocked = false
+    private var isSleeping = false
+
     private static let notificationCategoryId = "DESKDROP_ITEM"
     private static let actionCopy = "ACTION_COPY"
     private static let actionCopyPath = "ACTION_COPY_PATH"
@@ -50,68 +62,93 @@ final class DropStore: NSObject, ObservableObject {
         if defaults.object(forKey: "autoCopyToClipboard") == nil {
             defaults.set(true, forKey: "autoCopyToClipboard")
         }
-        if defaults.object(forKey: "autoStopOnIdle") == nil {
-            defaults.set(true, forKey: "autoStopOnIdle")
+        if defaults.object(forKey: "pauseOnLockSleep") == nil {
+            defaults.set(true, forKey: "pauseOnLockSleep")
         }
         self.autoCopyToClipboard = defaults.bool(forKey: "autoCopyToClipboard")
-        self.bleBeaconEnabled = defaults.bool(forKey: "bleBeaconEnabled")
-        self.autoStopOnIdle = defaults.bool(forKey: "autoStopOnIdle")
+        self.pauseOnLockSleep = defaults.bool(forKey: "pauseOnLockSleep")
+        self.trustedWiFiOnly = defaults.bool(forKey: "trustedWiFiOnly")
+        self.trustedSSIDs = defaults.stringArray(forKey: "trustedSSIDs") ?? []
         super.init()
 
         self.items = storage.loadHistory()
+        self.pairedDevices = authManager.listDevices()
+
+        do {
+            let bundle = try TLSIdentityManager.loadOrCreateIdentity()
+            self.tlsBundle = bundle
+            self.shortFingerprint = bundle.shortFingerprint
+        } catch {
+            self.serverError = "TLS setup failed: \(error.localizedDescription)"
+        }
+
         configureNotifications()
-        startListening()
+        observeLockAndSleep()
+        wifiMonitor.onNetworkChange = { [weak self] in
+            self?.evaluateLifecycle()
+        }
+        evaluateLifecycle()
     }
 
     func toggleListening() {
         if isListening {
-            stopListening(reason: "Stopped")
+            manuallyStopped = true
+            stopServer(reason: "Stopped manually")
         } else {
-            startListening()
+            manuallyStopped = false
+            startServerIfPossible()
         }
     }
 
-    func startListening() {
-        statusNote = nil
-        serverError = nil
-        isListening = true
-
-        if server == nil {
-            server = DropServer(
-                preferredPort: 51234,
-                onStatusChange: { [weak self] port, error in
-                    Task { @MainActor [weak self] in
-                        self?.listeningPort = port
-                        self?.serverError = error
-                    }
-                },
-                onActivity: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        self?.resetIdleTimer()
-                    }
-                },
-                onReceive: { [weak self] payload in
-                    guard let self else { return false }
-                    return await self.handleIncoming(payload)
-                }
-            )
+    func startPairing() {
+        if !isListening {
+            manuallyStopped = false
+            startServerIfPossible()
         }
 
-        server?.start()
-        if bleBeaconEnabled {
-            bleBeacon.start()
+        let session = authManager.startPairingSession(ttlSeconds: 60)
+        activePairingCode = session.code
+        pairingSecondsLeft = 60
+        updatePairingQR(code: session.code)
+
+        pairingTimerTask?.cancel()
+        pairingTimerTask = Task { @MainActor [weak self] in
+            while let self, let active = self.authManager.currentPairingSession() {
+                let left = max(0, Int(ceil(active.expiresAt.timeIntervalSinceNow)))
+                self.pairingSecondsLeft = left
+                if left == 0 { break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.stopPairing()
         }
-        resetIdleTimer()
     }
 
-    func stopListening(reason: String = "Stopped") {
-        idleTimerTask?.cancel()
-        idleTimerTask = nil
-        isListening = false
-        listeningPort = nil
-        statusNote = reason
-        server?.stop()
-        bleBeacon.stop()
+    func stopPairing() {
+        pairingTimerTask?.cancel()
+        pairingTimerTask = nil
+        authManager.stopPairingSession()
+        activePairingCode = nil
+        pairingSecondsLeft = 0
+        pairingQRImage = nil
+    }
+
+    func revokeDevice(_ device: PairedDevice) {
+        authManager.revokeDevice(id: device.id)
+        pairedDevices = authManager.listDevices()
+    }
+
+    func trustCurrentWiFi() {
+        wifiMonitor.requestLocationAccessIfNeeded()
+        wifiMonitor.refreshSSID()
+        guard let ssid = wifiMonitor.currentSSID, !ssid.isEmpty else { return }
+        if !trustedSSIDs.contains(ssid) {
+            trustedSSIDs.append(ssid)
+        }
+    }
+
+    func removeTrustedSSID(_ ssid: String) {
+        trustedSSIDs.removeAll { $0 == ssid }
     }
 
     func openReceivedFolder() {
@@ -152,20 +189,132 @@ final class DropStore: NSObject, ObservableObject {
         storage.saveHistory(items)
     }
 
-    private func resetIdleTimer() {
-        idleTimerTask?.cancel()
-        guard isListening, autoStopOnIdle else { return }
-        idleTimerTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.idleTimeoutSeconds * 1_000_000_000)
-            guard !Task.isCancelled, let self, self.isListening, self.autoStopOnIdle else { return }
-            self.stopListening(reason: "Auto-stopped after 2m inactivity")
+    private func updatePairingQR(code: String) {
+        guard let bundle = tlsBundle else { return }
+        let host = NetworkUtils.localIPv4Addresses().first ?? ""
+        let port = listeningPort ?? 51234
+        let name = Host.current().localizedName ?? "Mac"
+        let payload: [String: Any] = [
+            "v": 1,
+            "h": host,
+            "p": Int(port),
+            "fp": bundle.certFingerprintHex,
+            "c": code,
+            "n": name
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let jsonString = String(data: data, encoding: .utf8) {
+            pairingQRImage = QRCodeGenerator.generate(from: jsonString, size: 170)
+        }
+    }
+
+    private func evaluateLifecycle() {
+        if manuallyStopped {
+            stopServer(reason: "Stopped manually")
+            return
+        }
+        if pauseOnLockSleep && (isScreenLocked || isSleeping) {
+            stopServer(reason: "Paused (Mac locked/asleep)")
+            return
+        }
+        if trustedWiFiOnly {
+            wifiMonitor.refreshSSID()
+            if !wifiMonitor.isOnWiFi {
+                stopServer(reason: "Paused (Wi-Fi disconnected)")
+                return
+            }
+            guard let ssid = wifiMonitor.currentSSID, !ssid.isEmpty else {
+                stopServer(reason: "Paused (Enable Location to verify Wi-Fi)")
+                return
+            }
+            if !trustedSSIDs.contains(ssid) {
+                stopServer(reason: "Paused (Untrusted Wi-Fi: \(ssid))")
+                return
+            }
+        }
+        if !isListening {
+            startServerIfPossible()
+        }
+    }
+
+    private func startServerIfPossible() {
+        guard let bundle = tlsBundle else { return }
+        statusNote = nil
+        serverError = nil
+        isListening = true
+
+        if server == nil {
+            server = DropServer(
+                preferredPort: 51234,
+                tlsIdentity: bundle.identity,
+                shortFingerprint: bundle.shortFingerprint,
+                authManager: authManager,
+                onStatusChange: { [weak self] port, error in
+                    Task { @MainActor [weak self] in
+                        self?.listeningPort = port
+                        self?.serverError = error
+                        if let code = self?.activePairingCode {
+                            self?.updatePairingQR(code: code)
+                        }
+                    }
+                },
+                onPairSuccess: { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.pairedDevices = self.authManager.listDevices()
+                        self.stopPairing()
+                    }
+                },
+                onReceive: { [weak self] payload in
+                    guard let self else { return false }
+                    return await self.handleIncoming(payload)
+                }
+            )
+        }
+        server?.start()
+    }
+
+    private func stopServer(reason: String) {
+        stopPairing()
+        isListening = false
+        listeningPort = nil
+        statusNote = reason
+        server?.stop()
+    }
+
+    private func observeLockAndSleep() {
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isScreenLocked = true
+                self?.evaluateLifecycle()
+            }
+        }
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isScreenLocked = false
+                self?.evaluateLifecycle()
+            }
+        }
+
+        let wnc = NSWorkspace.shared.notificationCenter
+        wnc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSleeping = true
+                self?.evaluateLifecycle()
+            }
+        }
+        wnc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSleeping = false
+                self?.evaluateLifecycle()
+            }
         }
     }
 
     private func handleIncoming(_ payload: DropPayload) async -> Bool {
-        resetIdleTimer()
         switch payload {
-        case .text(let text):
+        case .text(let text, let senderName):
             let preview = String(text.prefix(4000))
             let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 .components(separatedBy: .newlines)
@@ -179,10 +328,10 @@ final class DropStore: NSObject, ObservableObject {
             if autoCopyToClipboard {
                 ClipboardManager.copyText(text)
             }
-            recordItem(item, notificationTitle: "Text Received", notificationBody: preview)
+            recordItem(item, notificationTitle: "Text from \(senderName)", notificationBody: preview)
             return true
 
-        case .file(let data, let filename, let mimeType):
+        case .file(let data, let filename, let mimeType, let senderName):
             do {
                 let (savedURL, isImage) = try storage.saveFile(
                     data: data,
@@ -203,7 +352,7 @@ final class DropStore: NSObject, ObservableObject {
                         ClipboardManager.copyFileURL(savedURL)
                     }
                 }
-                let notifTitle = isImage ? "Screenshot / Image" : "File Received"
+                let notifTitle = isImage ? "Image from \(senderName)" : "File from \(senderName)"
                 let notifBody = "\(savedURL.lastPathComponent) (\(item.formattedSize))" +
                     (autoCopyToClipboard ? " • Copied" : "")
                 recordItem(item, notificationTitle: notifTitle, notificationBody: notifBody)
@@ -228,21 +377,9 @@ final class DropStore: NSObject, ObservableObject {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
-        let copyAction = UNNotificationAction(
-            identifier: Self.actionCopy,
-            title: "Copy",
-            options: []
-        )
-        let copyPathAction = UNNotificationAction(
-            identifier: Self.actionCopyPath,
-            title: "Copy Path",
-            options: []
-        )
-        let revealAction = UNNotificationAction(
-            identifier: Self.actionReveal,
-            title: "Show in Finder",
-            options: [.foreground]
-        )
+        let copyAction = UNNotificationAction(identifier: Self.actionCopy, title: "Copy", options: [])
+        let copyPathAction = UNNotificationAction(identifier: Self.actionCopyPath, title: "Copy Path", options: [])
+        let revealAction = UNNotificationAction(identifier: Self.actionReveal, title: "Show in Finder", options: [.foreground])
 
         let category = UNNotificationCategory(
             identifier: Self.notificationCategoryId,

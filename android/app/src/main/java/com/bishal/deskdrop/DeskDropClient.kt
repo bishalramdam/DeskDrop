@@ -5,24 +5,48 @@ import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.provider.OpenableColumns
 import org.json.JSONObject
 import java.io.BufferedInputStream
-import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.cert.CertificateException
+import java.security.cert.X509Certificate
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
+
+data class DiscoveredMac(
+    val host: String,
+    val port: Int,
+    val name: String,
+    val certFingerprint: String,
+    val shortFingerprint: String,
+    val pairingActive: Boolean
+)
 
 object DeskDropClient {
     private const val SERVICE_TYPE = "_deskdrop._tcp."
+    private val secureRandom = SecureRandom()
 
-    fun ping(host: String, port: Int, timeoutMs: Int = 900): MacTarget? {
+    fun fetchMacInfo(host: String, port: Int, timeoutMs: Int = 1800): DiscoveredMac? {
         return try {
-            val url = URL("http://$host:$port/ping")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
+            val capturedFingerprint = AtomicReference<String?>(null)
+            val url = URL("https://$host:$port/info")
+            val conn = (url.openConnection() as HttpsURLConnection).apply {
+                sslSocketFactory = buildCapturingSocketFactory(capturedFingerprint)
+                hostnameVerifier = HostnameVerifier { _, _ -> true }
                 requestMethod = "GET"
                 connectTimeout = timeoutMs
                 readTimeout = timeoutMs
@@ -31,11 +55,101 @@ object DeskDropClient {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().readText()
                     val json = JSONObject(body)
+                    val fp = capturedFingerprint.get() ?: return null
                     if (json.optString("app") == "DeskDrop") {
-                        MacTarget(
+                        DiscoveredMac(
                             host = host,
                             port = json.optInt("port", port),
-                            name = json.optString("name", "Mac")
+                            name = json.optString("name", "Mac"),
+                            certFingerprint = fp,
+                            shortFingerprint = json.optString("fp", formatShortFp(fp)),
+                            pairingActive = json.optBoolean("pairing", false)
+                        )
+                    } else null
+                } else null
+            } finally {
+                conn.disconnect()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun pairWithMac(
+        context: Context,
+        host: String,
+        port: Int,
+        expectedFingerprint: String,
+        code: String
+    ): Result<PairedMac> {
+        return try {
+            val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+            val bodyJson = JSONObject().apply {
+                put("code", code.trim())
+                put("deviceName", deviceName)
+            }.toString().toByteArray(Charsets.UTF_8)
+
+            val url = URL("https://$host:$port/pair")
+            val conn = openPinnedConnection(url, expectedFingerprint, timeoutMs = 4000).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setFixedLengthStreamingMode(bodyJson.size)
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+
+            try {
+                conn.outputStream.use { it.write(bodyJson) }
+                val codeResp = conn.responseCode
+                val respText = if (codeResp in 200..299) {
+                    conn.inputStream.bufferedReader().readText()
+                } else {
+                    conn.errorStream?.bufferedReader()?.readText() ?: ""
+                }
+
+                if (codeResp in 200..299) {
+                    val obj = JSONObject(respText)
+                    val paired = PairedMac(
+                        host = host,
+                        port = port,
+                        name = obj.optString("name", "Mac"),
+                        certFingerprint = expectedFingerprint.lowercase(),
+                        deviceId = obj.getString("deviceId"),
+                        tokenHex = obj.getString("token")
+                    )
+                    DeskDropPrefs.savePairedMac(context, paired)
+                    Result.success(paired)
+                } else {
+                    val errMsg = try {
+                        JSONObject(respText).optString("error", "Pairing failed ($codeResp)")
+                    } catch (_: Exception) {
+                        "Pairing failed (HTTP $codeResp)"
+                    }
+                    Result.failure(RuntimeException(errMsg))
+                }
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun pingPairedMac(mac: PairedMac, timeoutMs: Int = 900): PairedMac? {
+        return try {
+            val path = "/ping"
+            val url = URL("https://${mac.host}:${mac.port}$path")
+            val conn = openPinnedConnection(url, mac.certFingerprint, timeoutMs = timeoutMs).apply {
+                requestMethod = "GET"
+                applyHmacAuth(this, mac, "GET", path)
+            }
+            try {
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    val json = JSONObject(body)
+                    if (json.optString("app") == "DeskDrop") {
+                        mac.copy(
+                            port = json.optInt("port", mac.port),
+                            name = json.optString("name", mac.name)
                         )
                     } else null
                 } else null
@@ -48,7 +162,7 @@ object DeskDropClient {
     }
 
     @Suppress("DEPRECATION")
-    fun discoverMac(context: Context, timeoutMs: Long = 2800): MacTarget? {
+    fun discoverEndpointOnWifi(context: Context, timeoutMs: Long = 2800): Pair<String, Int>? {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val multicastLock = wifi?.createMulticastLock("DeskDropNsdLock")?.apply {
             setReferenceCounted(false)
@@ -56,7 +170,7 @@ object DeskDropClient {
         }
 
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
-        val found = AtomicReference<MacTarget?>(null)
+        val found = AtomicReference<Pair<String, Int>?>(null)
         val latch = CountDownLatch(1)
         val stopped = AtomicReference(false)
 
@@ -77,12 +191,7 @@ object DeskDropClient {
                         val hostAddr = resolved.host?.let { addr ->
                             if (addr is Inet4Address) addr.hostAddress else addr.hostAddress
                         } ?: return
-                        val target = MacTarget(
-                            host = hostAddr,
-                            port = resolved.port,
-                            name = resolved.serviceName ?: "Mac"
-                        )
-                        if (found.compareAndSet(null, target)) {
+                        if (found.compareAndSet(null, hostAddr to resolved.port)) {
                             latch.countDown()
                         }
                     }
@@ -110,36 +219,38 @@ object DeskDropClient {
         }
     }
 
-    fun resolveTarget(context: Context): MacTarget? {
-        DeskDropPrefs.getTarget(context)?.let { cached ->
-            ping(cached.host, cached.port, timeoutMs = 500)?.let { verified ->
-                DeskDropPrefs.saveTarget(context, verified)
-                return verified
-            }
+    fun resolvePairedMac(context: Context): PairedMac? {
+        val saved = DeskDropPrefs.getPairedMac(context) ?: return null
+        pingPairedMac(saved, timeoutMs = 600)?.let { verified ->
+            DeskDropPrefs.savePairedMac(context, verified)
+            return verified
         }
-        val discovered = discoverMac(context) ?: return null
-        DeskDropPrefs.saveTarget(context, discovered)
-        return discovered
+        val (newHost, newPort) = discoverEndpointOnWifi(context) ?: return null
+        val candidate = saved.copy(host = newHost, port = newPort)
+        val verified = pingPairedMac(candidate, timeoutMs = 900) ?: return null
+        DeskDropPrefs.savePairedMac(context, verified)
+        return verified
     }
 
-    fun sendText(target: MacTarget, text: String): Result<Unit> {
+    fun sendText(mac: PairedMac, text: String): Result<Unit> {
         return try {
+            val path = "/drop/text"
             val payload = text.toByteArray(Charsets.UTF_8)
-            val url = URL("http://${target.host}:${target.port}/drop/text")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
+            val url = URL("https://${mac.host}:${mac.port}$path")
+            val conn = openPinnedConnection(url, mac.certFingerprint, timeoutMs = 4000, readTimeoutMs = 8000).apply {
                 requestMethod = "POST"
                 doOutput = true
-                connectTimeout = 3000
-                readTimeout = 8000
                 setFixedLengthStreamingMode(payload.size)
                 setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                applyHmacAuth(this, mac, "POST", path)
             }
             try {
                 conn.outputStream.use { it.write(payload) }
-                if (conn.responseCode in 200..299) {
+                val code = conn.responseCode
+                if (code in 200..299) {
                     Result.success(Unit)
                 } else {
-                    Result.failure(RuntimeException("Mac returned HTTP ${conn.responseCode}"))
+                    Result.failure(RuntimeException(httpErrorMessage(code, conn)))
                 }
             } finally {
                 conn.disconnect()
@@ -149,22 +260,22 @@ object DeskDropClient {
         }
     }
 
-    fun sendUri(context: Context, target: MacTarget, uri: Uri): Result<String> {
+    fun sendUri(context: Context, mac: PairedMac, uri: Uri): Result<String> {
         return try {
+            val path = "/drop/file"
             val resolver = context.contentResolver
             val mimeType = resolver.getType(uri) ?: "application/octet-stream"
             val filename = queryFilename(context, uri) ?: defaultFilename(mimeType)
             val encodedName = URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
             val knownSize = querySize(context, uri)
 
-            val url = URL("http://${target.host}:${target.port}/drop/file")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
+            val url = URL("https://${mac.host}:${mac.port}$path")
+            val conn = openPinnedConnection(url, mac.certFingerprint, timeoutMs = 4000, readTimeoutMs = 30000).apply {
                 requestMethod = "POST"
                 doOutput = true
-                connectTimeout = 3000
-                readTimeout = 30000
                 setRequestProperty("Content-Type", mimeType)
                 setRequestProperty("X-Filename", encodedName)
+                applyHmacAuth(this, mac, "POST", path)
             }
 
             try {
@@ -183,16 +294,133 @@ object DeskDropClient {
                     conn.outputStream.use { it.write(bytes) }
                 }
 
-                if (conn.responseCode in 200..299) {
+                val code = conn.responseCode
+                if (code in 200..299) {
                     Result.success(filename)
                 } else {
-                    Result.failure(RuntimeException("Mac returned HTTP ${conn.responseCode}"))
+                    Result.failure(RuntimeException(httpErrorMessage(code, conn)))
                 }
             } finally {
                 conn.disconnect()
             }
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    private fun httpErrorMessage(code: Int, conn: HttpsURLConnection): String {
+        if (code == 401) return "Unauthorized — re-pair with Mac"
+        return try {
+            val text = conn.errorStream?.bufferedReader()?.readText().orEmpty()
+            JSONObject(text).optString("error", "Mac returned HTTP $code")
+        } catch (_: Exception) {
+            "Mac returned HTTP $code"
+        }
+    }
+
+    private fun applyHmacAuth(conn: HttpsURLConnection, mac: PairedMac, method: String, path: String) {
+        val timestamp = (System.currentTimeMillis() / 1000L).toString()
+        val nonceBytes = ByteArray(16).also { secureRandom.nextBytes(it) }
+        val nonce = nonceBytes.joinToString("") { "%02x".format(it) }
+        val message = "${method.uppercase()}\n$path\n$timestamp\n$nonce"
+
+        val keyBytes = hexToBytes(mac.tokenHex)
+        val hmac = Mac.getInstance("HmacSHA256").apply {
+            init(SecretKeySpec(keyBytes, "HmacSHA256"))
+        }
+        val sigHex = hmac.doFinal(message.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+        conn.setRequestProperty("X-DeskDrop-Device", mac.deviceId)
+        conn.setRequestProperty("X-DeskDrop-Timestamp", timestamp)
+        conn.setRequestProperty("X-DeskDrop-Nonce", nonce)
+        conn.setRequestProperty("X-DeskDrop-Sig", sigHex)
+    }
+
+    private fun openPinnedConnection(
+        url: URL,
+        expectedFingerprintHex: String,
+        timeoutMs: Int = 3000,
+        readTimeoutMs: Int = 6000
+    ): HttpsURLConnection {
+        return (url.openConnection() as HttpsURLConnection).apply {
+            sslSocketFactory = buildPinnedSocketFactory(expectedFingerprintHex)
+            hostnameVerifier = HostnameVerifier { _, _ -> true }
+            connectTimeout = timeoutMs
+            readTimeout = readTimeoutMs
+        }
+    }
+
+    private fun buildPinnedSocketFactory(expectedFingerprintHex: String): SSLSocketFactory {
+        val expected = expectedFingerprintHex.lowercase()
+        val trustManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+                val leaf = chain.firstOrNull() ?: throw CertificateException("Empty cert chain")
+                val actual = sha256Hex(leaf.encoded)
+                if (!constantTimeEquals(actual, expected)) {
+                    throw CertificateException("TLS certificate fingerprint mismatch")
+                }
+            }
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        return SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(trustManager), secureRandom)
+        }.socketFactory
+    }
+
+    private fun buildCapturingSocketFactory(outFingerprint: AtomicReference<String?>): SSLSocketFactory {
+        val trustManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+                val leaf = chain.firstOrNull() ?: throw CertificateException("Empty cert chain")
+                outFingerprint.set(sha256Hex(leaf.encoded))
+            }
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        return SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(trustManager), secureRandom)
+        }.socketFactory
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        return MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun formatShortFp(hex: String): String {
+        return hex.take(12).uppercase().chunked(4).joinToString(":")
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.trim()
+        val out = ByteArray(clean.length / 2)
+        for (i in out.indices) {
+            out[i] = clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+        return out
+    }
+
+    private fun constantTimeEquals(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var diff = 0
+        for (i in a.indices) {
+            diff = diff or (a[i].code xor b[i].code)
+        }
+        return diff == 0
+    }
+
+    private fun queryFilename(context: Context, uri: Uri): String? {
+        return try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -206,19 +434,6 @@ object DeskDropClient {
             } ?: -1L
         } catch (_: Exception) {
             -1L
-        }
-    }
-
-    private fun queryFilename(context: Context, uri: Uri): String? {
-        return try {
-            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (idx >= 0) cursor.getString(idx) else null
-                } else null
-            }
-        } catch (_: Exception) {
-            null
         }
     }
 

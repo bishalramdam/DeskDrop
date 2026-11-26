@@ -34,5 +34,7 @@
     </array>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>DeskDrop uses Bluetooth Low Energy for nearby device discovery.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>DeskDrop reads your current Wi-Fi network name (SSID) when Trusted Wi-Fi Only mode is enabled.</string>
 </dict>
 </plist>

@@ -35,7 +35,7 @@ class ShareActivity : AppCompatActivity() {
             retryButton.visibility = View.GONE
             progress.visibility = View.VISIBLE
             titleText.text = "Sending to Mac..."
-            subtitleText.text = "Retrying on Wi-Fi"
+            subtitleText.text = "Connecting securely over Wi-Fi"
             handleShareIntent(intent)
         }
 
@@ -72,17 +72,22 @@ class ShareActivity : AppCompatActivity() {
             return
         }
 
+        if (DeskDropPrefs.getPairedMac(this) == null) {
+            showFailure("Not paired with Mac. Open DeskDrop to scan QR or enter pairing code.")
+            return
+        }
+
         executor.execute {
-            val target = DeskDropClient.resolveTarget(this)
+            val target = DeskDropClient.resolvePairedMac(this)
             if (target == null) {
                 runOnUiThread {
-                    showFailure("Mac not found on Wi-Fi. Open DeskDrop on Mac & phone to pair.")
+                    showFailure("Mac is locked, paused, or unreachable on Wi-Fi.")
                 }
                 return@execute
             }
 
             runOnUiThread {
-                subtitleText.text = "Sending to ${target.name} (${target.host})"
+                subtitleText.text = "Sending encrypted to ${target.name}..."
             }
 
             if (uris.isNotEmpty()) {

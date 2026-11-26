@@ -1,9 +1,10 @@
 import Foundation
 import Network
+import Security
 
 enum DropPayload: Sendable {
-    case text(String)
-    case file(data: Data, filename: String?, mimeType: String?)
+    case text(String, senderName: String)
+    case file(data: Data, filename: String?, mimeType: String?, senderName: String)
 }
 
 final class DropServer: @unchecked Sendable {
@@ -11,19 +12,28 @@ final class DropServer: @unchecked Sendable {
     private var listener: NWListener?
     private var activeSessions: [ObjectIdentifier: HTTPConnectionSession] = [:]
     private let preferredPort: UInt16
+    private let tlsIdentity: SecIdentity
+    private let shortFingerprint: String
+    private let authManager: AuthManager
     private let onReceive: @Sendable (DropPayload) async -> Bool
-    private let onActivity: @Sendable () -> Void
+    private let onPairSuccess: @Sendable (PairedDevice) -> Void
     private let onStatusChange: @Sendable (UInt16?, String?) -> Void
 
     init(
         preferredPort: UInt16 = 51234,
+        tlsIdentity: SecIdentity,
+        shortFingerprint: String,
+        authManager: AuthManager,
         onStatusChange: @escaping @Sendable (UInt16?, String?) -> Void,
-        onActivity: @escaping @Sendable () -> Void = {},
+        onPairSuccess: @escaping @Sendable (PairedDevice) -> Void,
         onReceive: @escaping @Sendable (DropPayload) async -> Bool
     ) {
         self.preferredPort = preferredPort
+        self.tlsIdentity = tlsIdentity
+        self.shortFingerprint = shortFingerprint
+        self.authManager = authManager
         self.onStatusChange = onStatusChange
-        self.onActivity = onActivity
+        self.onPairSuccess = onPairSuccess
         self.onReceive = onReceive
     }
 
@@ -44,8 +54,15 @@ final class DropServer: @unchecked Sendable {
 
     private func startListener(port: NWEndpoint.Port?) {
         do {
-            let params = NWParameters.tcp
+            let tlsOptions = NWProtocolTLS.Options()
+            if let secId = sec_identity_create(tlsIdentity) {
+                sec_protocol_options_set_local_identity(tlsOptions.securityProtocolOptions, secId)
+            }
+            sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
+
+            let params = NWParameters(tls: tlsOptions)
             params.allowLocalEndpointReuse = true
+
             let nwListener = try NWListener(using: params, on: port ?? .any)
             let deviceName = Host.current().localizedName ?? "Mac"
             nwListener.service = NWListener.Service(name: deviceName, type: "_deskdrop._tcp")
@@ -58,7 +75,6 @@ final class DropServer: @unchecked Sendable {
                     self.onStatusChange(actualPort, nil)
                 case .failed(let error):
                     if port != nil {
-                        // Preferred port might be busy; fall back to any available port.
                         nwListener.cancel()
                         self.startListener(port: nil)
                     } else {
@@ -83,11 +99,13 @@ final class DropServer: @unchecked Sendable {
     }
 
     private func handleConnection(_ connection: NWConnection) {
-        onActivity()
         connection.start(queue: queue)
         let session = HTTPConnectionSession(
             connection: connection,
             portProvider: { [weak self] in self?.listener?.port?.rawValue ?? self?.preferredPort ?? 51234 },
+            shortFingerprint: shortFingerprint,
+            authManager: authManager,
+            onPairSuccess: onPairSuccess,
             onReceive: onReceive
         )
         let id = ObjectIdentifier(session)
@@ -104,6 +122,9 @@ private final class HTTPConnectionSession: @unchecked Sendable {
 
     private let connection: NWConnection
     private let portProvider: () -> UInt16
+    private let shortFingerprint: String
+    private let authManager: AuthManager
+    private let onPairSuccess: @Sendable (PairedDevice) -> Void
     private let onReceive: @Sendable (DropPayload) async -> Bool
 
     private var buffer = Data()
@@ -120,10 +141,16 @@ private final class HTTPConnectionSession: @unchecked Sendable {
     init(
         connection: NWConnection,
         portProvider: @escaping () -> UInt16,
+        shortFingerprint: String,
+        authManager: AuthManager,
+        onPairSuccess: @escaping @Sendable (PairedDevice) -> Void,
         onReceive: @escaping @Sendable (DropPayload) async -> Bool
     ) {
         self.connection = connection
         self.portProvider = portProvider
+        self.shortFingerprint = shortFingerprint
+        self.authManager = authManager
+        self.onPairSuccess = onPairSuccess
         self.onReceive = onReceive
     }
 
@@ -207,13 +234,56 @@ private final class HTTPConnectionSession: @unchecked Sendable {
     }
 
     private func processRequest(body: Data) {
+        let deviceName = Host.current().localizedName ?? "Mac"
+        let escapedMacName = jsonEscape(deviceName)
+
+        // Public discovery metadata (does not accept drops or expose secrets)
+        if method == "GET" && path == "/info" {
+            let pairingActive = authManager.currentPairingSession() != nil
+            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(portProvider()),"fp":"\#(shortFingerprint)","pairing":\#(pairingActive),"tls":true}"#
+            sendResponse(status: "200 OK", body: json)
+            return
+        }
+
+        // One-time pairing endpoint (only open during 60s pairing window)
+        if method == "POST" && path == "/pair" {
+            guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let code = obj["code"] as? String else {
+                sendResponse(status: "400 Bad Request", body: #"{"error":"Missing pairing code"}"#)
+                return
+            }
+            let phoneName = (obj["deviceName"] as? String) ?? "Android Phone"
+            switch authManager.completePairing(code: code, deviceName: phoneName) {
+            case .notInPairingMode:
+                sendResponse(status: "403 Forbidden", body: #"{"error":"Mac is not in pairing mode"}"#)
+            case .invalidCode(let remaining):
+                sendResponse(status: "401 Unauthorized", body: #"{"error":"Invalid pairing code","remaining":\#(remaining)}"#)
+            case .success(let device):
+                onPairSuccess(device)
+                let escapedToken = jsonEscape(device.tokenHex)
+                let escapedId = jsonEscape(device.id)
+                let json = #"{"deviceId":"\#(escapedId)","token":"\#(escapedToken)","name":"\#(escapedMacName)"}"#
+                sendResponse(status: "200 OK", body: json)
+            }
+            return
+        }
+
+        // All remaining endpoints require paired HMAC-SHA256 authentication
+        guard let sender = authManager.verifyRequest(
+            method: method,
+            path: path,
+            deviceId: headers["x-deskdrop-device"],
+            timestampHeader: headers["x-deskdrop-timestamp"],
+            nonce: headers["x-deskdrop-nonce"],
+            signatureHex: headers["x-deskdrop-sig"]
+        ) else {
+            sendResponse(status: "401 Unauthorized", body: #"{"error":"Unauthorized"}"#)
+            return
+        }
+
         switch (method, path) {
         case ("GET", "/ping"):
-            let deviceName = Host.current().localizedName ?? "Mac"
-            let escapedName = deviceName
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            let json = #"{"app":"DeskDrop","name":"\#(escapedName)","port":\#(portProvider()),"version":"1.0.0"}"#
+            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(portProvider()),"tls":true,"version":"2.0.0"}"#
             sendResponse(status: "200 OK", body: json)
 
         case ("POST", "/drop/text"):
@@ -232,7 +302,7 @@ private final class HTTPConnectionSession: @unchecked Sendable {
             }
 
             Task {
-                let ok = await onReceive(.text(text))
+                let ok = await onReceive(.text(text, senderName: sender.name))
                 if ok {
                     sendResponse(status: "200 OK", body: #"{"ok":true,"kind":"text"}"#)
                 } else {
@@ -248,7 +318,7 @@ private final class HTTPConnectionSession: @unchecked Sendable {
             let rawName = headers["x-filename"]?.removingPercentEncoding
             let mimeType = headers["content-type"]
             Task {
-                let ok = await onReceive(.file(data: body, filename: rawName, mimeType: mimeType))
+                let ok = await onReceive(.file(data: body, filename: rawName, mimeType: mimeType, senderName: sender.name))
                 if ok {
                     sendResponse(status: "200 OK", body: #"{"ok":true,"kind":"file"}"#)
                 } else {
@@ -259,6 +329,11 @@ private final class HTTPConnectionSession: @unchecked Sendable {
         default:
             sendResponse(status: "404 Not Found", body: #"{"error":"Not found"}"#)
         }
+    }
+
+    private func jsonEscape(_ raw: String) -> String {
+        raw.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     private func sendResponse(status: String, body: String) {

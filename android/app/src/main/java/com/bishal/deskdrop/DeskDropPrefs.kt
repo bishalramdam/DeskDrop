@@ -1,43 +1,110 @@
 package com.bishal.deskdrop
 
 import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
+import org.json.JSONObject
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
-data class MacTarget(
+data class PairedMac(
     val host: String,
     val port: Int,
-    val name: String = "Mac"
+    val name: String,
+    val certFingerprint: String,
+    val deviceId: String,
+    val tokenHex: String
 )
 
 object DeskDropPrefs {
-    private const val PREFS_NAME = "deskdrop_prefs"
-    private const val KEY_HOST = "last_host"
-    private const val KEY_PORT = "last_port"
-    private const val KEY_NAME = "last_name"
+    private const val PREFS_NAME = "deskdrop_secure_prefs"
+    private const val KEY_PAYLOAD = "paired_mac_enc"
+    private const val KEY_ALIAS = "DeskDropMasterKey"
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
 
-    fun getTarget(context: Context): MacTarget? {
+    fun getPairedMac(context: Context): PairedMac? {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val host = prefs.getString(KEY_HOST, null)?.trim() ?: return null
-        if (host.isEmpty()) return null
-        val port = prefs.getInt(KEY_PORT, 51234)
-        val name = prefs.getString(KEY_NAME, "Mac") ?: "Mac"
-        return MacTarget(host, port, name)
+        val encoded = prefs.getString(KEY_PAYLOAD, null) ?: return null
+        return try {
+            val jsonStr = decrypt(encoded)
+            val obj = JSONObject(jsonStr)
+            PairedMac(
+                host = obj.getString("host"),
+                port = obj.getInt("port"),
+                name = obj.optString("name", "Mac"),
+                certFingerprint = obj.getString("fp"),
+                deviceId = obj.getString("deviceId"),
+                tokenHex = obj.getString("tokenHex")
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    fun saveTarget(context: Context, target: MacTarget) {
+    fun savePairedMac(context: Context, mac: PairedMac) {
+        val obj = JSONObject().apply {
+            put("host", mac.host.trim())
+            put("port", mac.port)
+            put("name", mac.name)
+            put("fp", mac.certFingerprint.lowercase())
+            put("deviceId", mac.deviceId)
+            put("tokenHex", mac.tokenHex)
+        }
+        val encrypted = encrypt(obj.toString())
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_HOST, target.host.trim())
-            .putInt(KEY_PORT, target.port)
-            .putString(KEY_NAME, target.name)
+            .putString(KEY_PAYLOAD, encrypted)
             .apply()
     }
 
-    fun clearTarget(context: Context) {
+    fun clearPairedMac(context: Context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .remove(KEY_HOST)
-            .remove(KEY_PORT)
-            .remove(KEY_NAME)
+            .remove(KEY_PAYLOAD)
             .apply()
+    }
+
+    private fun getOrCreateKey(): SecretKey {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        keyStore.getKey(KEY_ALIAS, null)?.let { return it as SecretKey }
+
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        val spec = KeyGenParameterSpec.Builder(
+            KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .build()
+        generator.init(spec)
+        return generator.generateKey()
+    }
+
+    private fun encrypt(plainText: String): String {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+        val iv = cipher.iv
+        val cipherBytes = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+        val combined = ByteArray(1 + iv.size + cipherBytes.size)
+        combined[0] = iv.size.toByte()
+        System.arraycopy(iv, 0, combined, 1, iv.size)
+        System.arraycopy(cipherBytes, 0, combined, 1 + iv.size, cipherBytes.size)
+        return Base64.encodeToString(combined, Base64.NO_WRAP)
+    }
+
+    private fun decrypt(encoded: String): String {
+        val combined = Base64.decode(encoded, Base64.NO_WRAP)
+        val ivLen = combined[0].toInt() and 0xFF
+        val iv = combined.copyOfRange(1, 1 + ivLen)
+        val cipherBytes = combined.copyOfRange(1 + ivLen, combined.size)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, iv))
+        val plain = cipher.doFinal(cipherBytes)
+        return String(plain, Charsets.UTF_8)
     }
 }

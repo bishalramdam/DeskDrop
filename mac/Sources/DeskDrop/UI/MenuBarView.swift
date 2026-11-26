@@ -8,15 +8,27 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             headerSection
+
+            if let code = store.activePairingCode {
+                Divider()
+                pairingSection(code: code)
+            }
+
             Divider()
-            controlsSection
+            securityControlsSection
+
+            if !store.pairedDevices.isEmpty {
+                Divider()
+                pairedDevicesSection
+            }
+
             Divider()
             recentDropsSection
             Divider()
             footerSection
         }
         .padding(12)
-        .frame(width: 340)
+        .frame(width: 360)
     }
 
     private var headerSection: some View {
@@ -28,6 +40,10 @@ struct MenuBarView: View {
                         .frame(width: 8, height: 8)
                     Text("DeskDrop")
                         .font(.headline)
+                    Image(systemName: "lock.shield.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .help("TLS + HMAC Authenticated")
                 }
                 if !store.isListening {
                     Text(store.statusNote ?? "Stopped")
@@ -36,7 +52,7 @@ struct MenuBarView: View {
                 } else if let port = store.listeningPort {
                     let ips = NetworkUtils.localIPv4Addresses()
                     let addressText = ips.first.map { "\($0):\(port)" } ?? "localhost:\(port)"
-                    Text("Listening on \(addressText) (Bonjour)")
+                    Text("HTTPS • \(addressText)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -45,12 +61,22 @@ struct MenuBarView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 } else {
-                    Text("Starting server...")
+                    Text("Starting TLS server...")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
+            Button(store.activePairingCode == nil ? "Pair" : "Cancel") {
+                if store.activePairingCode == nil {
+                    store.startPairing()
+                } else {
+                    store.stopPairing()
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
             Button(store.isListening ? "Stop" : "Start") {
                 store.toggleListening()
             }
@@ -60,17 +86,137 @@ struct MenuBarView: View {
         }
     }
 
-    private var controlsSection: some View {
+    private func pairingSection(code: String) -> some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Scan QR or enter code on phone")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Text("\(store.pairingSecondsLeft)s")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.orange)
+            }
+
+            if let qr = store.pairingQRImage {
+                Image(nsImage: qr)
+                    .interpolation(.none)
+                    .resizable()
+                    .frame(width: 140, height: 140)
+                    .padding(8)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
+            let spacedCode = "\(code.prefix(3)) \(code.suffix(3))"
+            Text(spacedCode)
+                .font(.title3.monospacedDigit().weight(.bold))
+                .textSelection(.enabled)
+
+            if !store.shortFingerprint.isEmpty {
+                Text("Cert: \(store.shortFingerprint)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(10)
+        .background(Color.primary.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var securityControlsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Auto-copy to Clipboard", isOn: $store.autoCopyToClipboard)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-            Toggle("Auto-stop after 2m idle", isOn: $store.autoStopOnIdle)
+
+            Toggle("Auto-pause when Mac locked/asleep", isOn: $store.pauseOnLockSleep)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-            Toggle("Bluetooth Nearby Beacon", isOn: $store.bleBeaconEnabled)
+
+            Toggle("Trusted Wi-Fi Only", isOn: $store.trustedWiFiOnly)
                 .toggleStyle(.switch)
                 .controlSize(.small)
+
+            if store.trustedWiFiOnly {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        if let ssid = store.wifiMonitor.currentSSID {
+                            Text("Wi-Fi: \(ssid)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if !store.trustedSSIDs.contains(ssid) {
+                                Button("Trust \"\(ssid)\"") {
+                                    store.trustCurrentWiFi()
+                                }
+                                .controlSize(.mini)
+                            }
+                        } else {
+                            Text("Enable Location Services for DeskDrop to read Wi-Fi name")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                            Spacer()
+                            Button("Refresh") {
+                                store.wifiMonitor.requestLocationAccessIfNeeded()
+                                store.wifiMonitor.refreshSSID()
+                            }
+                            .controlSize(.mini)
+                        }
+                    }
+
+                    if !store.trustedSSIDs.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 4) {
+                                ForEach(store.trustedSSIDs, id: \.self) { ssid in
+                                    HStack(spacing: 4) {
+                                        Text(ssid)
+                                            .font(.caption2)
+                                        Button {
+                                            store.removeTrustedSSID(ssid)
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 8, weight: .bold))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.accentColor.opacity(0.14))
+                                    .clipShape(Capsule())
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.leading, 4)
+            }
+        }
+    }
+
+    private var pairedDevicesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Paired Devices")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+
+            ForEach(store.pairedDevices) { device in
+                HStack {
+                    Image(systemName: "iphone")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(device.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer()
+                    Button("Revoke") {
+                        store.revokeDevice(device)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                }
+            }
         }
     }
 
@@ -95,13 +241,15 @@ struct MenuBarView: View {
                     Image(systemName: "tray.and.arrow.down")
                         .font(.title2)
                         .foregroundStyle(.tertiary)
-                    Text("Share a screenshot, photo, text, or file from your phone.")
+                    Text(store.pairedDevices.isEmpty
+                         ? "Click Pair above to link your Android phone."
+                         : "Share a screenshot, photo, text, or file from your phone.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 20)
+                .padding(.vertical, 16)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
@@ -124,7 +272,7 @@ struct MenuBarView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 260)
+                .frame(maxHeight: 210)
             }
         }
     }
