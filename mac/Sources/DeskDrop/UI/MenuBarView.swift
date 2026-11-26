@@ -8,31 +8,33 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             headerSection
+            Divider()
 
             if let code = store.activePairingCode {
-                Divider()
                 pairingSection(code: code)
-            }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                securityControlsSection
 
-            Divider()
-            securityControlsSection
+                if !store.pairedDevices.isEmpty {
+                    Divider()
+                    pairedDevicesSection
+                }
 
-            if !store.pairedDevices.isEmpty {
                 Divider()
-                pairedDevicesSection
+                recentDropsSection
+                    .frame(maxHeight: .infinity, alignment: .top)
             }
 
-            Divider()
-            recentDropsSection
             Divider()
             footerSection
         }
         .padding(12)
-        .frame(width: 360)
+        .frame(width: 360, height: 480)
     }
 
     private var headerSection: some View {
-        HStack {
+        HStack(spacing: 6) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Circle()
@@ -45,40 +47,46 @@ struct MenuBarView: View {
                         .foregroundStyle(.green)
                         .help("TLS + HMAC Authenticated")
                 }
-                if !store.isListening {
-                    Text(store.statusNote ?? "Stopped")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else if let port = store.listeningPort {
-                    let ips = NetworkUtils.localIPv4Addresses()
-                    let addressText = ips.first.map { "\($0):\(port)" } ?? "localhost:\(port)"
-                    Text("HTTPS • \(addressText)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                } else if let error = store.serverError {
-                    Text("Error: \(error)")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                } else {
-                    Text("Starting TLS server...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Group {
+                    if !store.isListening {
+                        Text(store.statusNote ?? "Stopped")
+                    } else if let port = store.listeningPort {
+                        let ips = NetworkUtils.localIPv4Addresses()
+                        let addressText = ips.first.map { "\($0):\(port)" } ?? "localhost:\(port)"
+                        Text("HTTPS • \(addressText)")
+                            .textSelection(.enabled)
+                    } else if let error = store.serverError {
+                        Text("Error: \(error)")
+                            .foregroundStyle(.red)
+                    } else {
+                        Text("Starting TLS server...")
+                    }
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
-            Spacer()
-            Button(store.activePairingCode == nil ? "Pair" : "Cancel") {
+
+            Spacer(minLength: 8)
+
+            Button {
                 if store.activePairingCode == nil {
                     store.startPairing()
                 } else {
                     store.stopPairing()
                 }
+            } label: {
+                Text(store.activePairingCode == nil ? "Pair" : "Cancel")
+                    .frame(minWidth: 46)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            Button(store.isListening ? "Stop" : "Start") {
+            Button {
                 store.toggleListening()
+            } label: {
+                Text(store.isListening ? "Stop" : "Start")
+                    .frame(minWidth: 38)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
@@ -87,41 +95,45 @@ struct MenuBarView: View {
     }
 
     private func pairingSection(code: String) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 14) {
+            Spacer(minLength: 0)
+
             HStack {
                 Text("Scan QR or enter code on phone")
-                    .font(.caption.weight(.medium))
+                    .font(.subheadline.weight(.medium))
                 Spacer()
                 Text("\(store.pairingSecondsLeft)s")
-                    .font(.caption.monospacedDigit())
+                    .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.orange)
             }
+            .padding(.horizontal, 8)
 
             if let qr = store.pairingQRImage {
                 Image(nsImage: qr)
                     .interpolation(.none)
                     .resizable()
-                    .frame(width: 140, height: 140)
-                    .padding(8)
+                    .frame(width: 180, height: 180)
+                    .padding(10)
                     .background(Color.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
             }
 
             let spacedCode = "\(code.prefix(3)) \(code.suffix(3))"
             Text(spacedCode)
-                .font(.title3.monospacedDigit().weight(.bold))
+                .font(.title2.monospacedDigit().weight(.bold))
                 .textSelection(.enabled)
 
             if !store.shortFingerprint.isEmpty {
                 Text("Cert: \(store.shortFingerprint)")
-                    .font(.caption2.monospaced())
+                    .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
+
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity)
-        .padding(10)
+        .padding(12)
         .background(Color.primary.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private var securityControlsSection: some View {
@@ -238,6 +250,7 @@ struct MenuBarView: View {
 
             if store.items.isEmpty {
                 VStack(spacing: 6) {
+                    Spacer(minLength: 0)
                     Image(systemName: "tray.and.arrow.down")
                         .font(.title2)
                         .foregroundStyle(.tertiary)
@@ -247,9 +260,9 @@ struct MenuBarView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                    Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
@@ -272,7 +285,7 @@ struct MenuBarView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 210)
+                .frame(maxHeight: .infinity)
             }
         }
     }

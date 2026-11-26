@@ -246,7 +246,7 @@ final class DropStore: NSObject, ObservableObject {
         if server == nil {
             server = DropServer(
                 preferredPort: 51234,
-                tlsIdentity: bundle.identity,
+                sslContext: bundle.sslContext,
                 shortFingerprint: bundle.shortFingerprint,
                 authManager: authManager,
                 onStatusChange: { [weak self] port, error in

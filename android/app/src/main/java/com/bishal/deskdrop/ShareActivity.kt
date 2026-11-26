@@ -78,12 +78,20 @@ class ShareActivity : AppCompatActivity() {
         }
 
         executor.execute {
-            val target = DeskDropClient.resolvePairedMac(this)
-            if (target == null) {
-                runOnUiThread {
-                    showFailure("Mac is locked, paused, or unreachable on Wi-Fi.")
+            val target = when (val status = DeskDropClient.resolvePairedMacStatus(this)) {
+                is MacCheckResult.Online -> status.mac
+                MacCheckResult.Revoked -> {
+                    runOnUiThread {
+                        showFailure("Device was revoked on Mac. Open DeskDrop to pair again.")
+                    }
+                    return@execute
                 }
-                return@execute
+                MacCheckResult.Unreachable -> {
+                    runOnUiThread {
+                        showFailure("Mac is locked, paused, or unreachable on Wi-Fi.")
+                    }
+                    return@execute
+                }
             }
 
             runOnUiThread {
@@ -111,7 +119,7 @@ class ShareActivity : AppCompatActivity() {
                     showSuccess("Sent to ${target.name}", summary)
                 }
             } else if (!sharedText.isNullOrBlank()) {
-                val res = DeskDropClient.sendText(target, sharedText)
+                val res = DeskDropClient.sendText(this, target, sharedText)
                 runOnUiThread {
                     res.onSuccess {
                         showSuccess("Sent to ${target.name}", "Copied text to Mac clipboard")

@@ -1,9 +1,9 @@
 import CryptoKit
 import Foundation
-import Security
+import NIOSSL
 
-struct TLSIdentityBundle {
-    let identity: SecIdentity
+struct TLSIdentityBundle: @unchecked Sendable {
+    let sslContext: NIOSSLContext
     let certFingerprintHex: String
 
     var shortFingerprint: String {
@@ -17,8 +17,6 @@ struct TLSIdentityBundle {
 }
 
 enum TLSIdentityManager {
-    private static let p12Passphrase = "deskdrop-local-tls"
-
     static func loadOrCreateIdentity() throws -> TLSIdentityBundle {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let tlsDir = appSupport.appendingPathComponent("DeskDrop/tls", isDirectory: true)
@@ -26,28 +24,30 @@ enum TLSIdentityManager {
 
         let keyURL = tlsDir.appendingPathComponent("server.key.pem")
         let certURL = tlsDir.appendingPathComponent("server.cert.pem")
-        let p12URL = tlsDir.appendingPathComponent("server.p12")
 
-        if !FileManager.default.fileExists(atPath: p12URL.path) {
-            try generateSelfSignedP12(keyURL: keyURL, certURL: certURL, p12URL: p12URL)
+        if !FileManager.default.fileExists(atPath: keyURL.path) ||
+            !FileManager.default.fileExists(atPath: certURL.path) {
+            try generateSelfSignedPEM(keyURL: keyURL, certURL: certURL)
         }
 
-        let p12Data = try Data(contentsOf: p12URL)
-        if let bundle = importP12(data: p12Data) {
-            return bundle
+        let certs = try NIOSSLCertificate.fromPEMFile(certURL.path)
+        guard let cert = certs.first else {
+            throw NSError(domain: "DeskDrop.TLS", code: -1, userInfo: [NSLocalizedDescriptionKey: "Empty TLS certificate"])
         }
+        let privateKey = try NIOSSLPrivateKey(file: keyURL.path, format: .pem)
+        let config = TLSConfiguration.makeServerConfiguration(
+            certificateChain: [.certificate(cert)],
+            privateKey: .privateKey(privateKey)
+        )
+        let sslContext = try NIOSSLContext(configuration: config)
 
-        // Regenerate once if existing p12 is corrupted or unreadable.
-        try? FileManager.default.removeItem(at: p12URL)
-        try generateSelfSignedP12(keyURL: keyURL, certURL: certURL, p12URL: p12URL)
-        let freshData = try Data(contentsOf: p12URL)
-        guard let freshBundle = importP12(data: freshData) else {
-            throw NSError(domain: "DeskDrop.TLS", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to load TLS identity"])
-        }
-        return freshBundle
+        let derBytes = try cert.toDERBytes()
+        let digest = SHA256.hash(data: Data(derBytes))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return TLSIdentityBundle(sslContext: sslContext, certFingerprintHex: hex)
     }
 
-    private static func generateSelfSignedP12(keyURL: URL, certURL: URL, p12URL: URL) throws {
+    private static func generateSelfSignedPEM(keyURL: URL, certURL: URL) throws {
         let hostName = Host.current().localizedName ?? "DeskDropMac"
 
         let genReq = Process()
@@ -61,53 +61,17 @@ enum TLSIdentityManager {
             "-nodes",
             "-subj", "/CN=DeskDrop (\(hostName))"
         ]
-        try runProcess(genReq)
-
-        let exportP12 = Process()
-        exportP12.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
-        exportP12.arguments = [
-            "pkcs12", "-export",
-            "-inkey", keyURL.path,
-            "-in", certURL.path,
-            "-out", p12URL.path,
-            "-passout", "pass:\(p12Passphrase)"
-        ]
-        try runProcess(exportP12)
-
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p12URL.path)
-    }
-
-    private static func runProcess(_ process: Process) throws {
         let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus != 0 {
+        genReq.standardError = pipe
+        genReq.standardOutput = pipe
+        try genReq.run()
+        genReq.waitUntilExit()
+        if genReq.terminationStatus != 0 {
             let errData = pipe.fileHandleForReading.readDataToEndOfFile()
             let msg = String(data: errData, encoding: .utf8) ?? "openssl failed"
-            throw NSError(domain: "DeskDrop.TLS", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: msg])
+            throw NSError(domain: "DeskDrop.TLS", code: Int(genReq.terminationStatus), userInfo: [NSLocalizedDescriptionKey: msg])
         }
-    }
 
-    private static func importP12(data: Data) -> TLSIdentityBundle? {
-        var items: CFArray?
-        let options: [String: Any] = [kSecImportExportPassphrase as String: p12Passphrase]
-        _ = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
-        guard let dicts = items as? [[String: Any]],
-              let first = dicts.first,
-              let identityObj = first[kSecImportItemIdentity as String] else {
-            return nil
-        }
-        let identity = identityObj as! SecIdentity
-
-        var certRef: SecCertificate?
-        SecIdentityCopyCertificate(identity, &certRef)
-        guard let cert = certRef else { return nil }
-        let derData = SecCertificateCopyData(cert) as Data
-        let digest = SHA256.hash(data: derData)
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return TLSIdentityBundle(identity: identity, certFingerprintHex: hex)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
     }
 }

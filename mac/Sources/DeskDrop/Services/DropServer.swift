@@ -1,6 +1,8 @@
 import Foundation
-import Network
-import Security
+import NIOCore
+import NIOHTTP1
+import NIOPosix
+import NIOSSL
 
 enum DropPayload: Sendable {
     case text(String, senderName: String)
@@ -8,28 +10,30 @@ enum DropPayload: Sendable {
 }
 
 final class DropServer: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.bishal.DeskDrop.server", qos: .userInitiated)
-    private var listener: NWListener?
-    private var activeSessions: [ObjectIdentifier: HTTPConnectionSession] = [:]
-    private let preferredPort: UInt16
-    private let tlsIdentity: SecIdentity
+    private let preferredPort: Int
+    private let sslContext: NIOSSLContext
     private let shortFingerprint: String
     private let authManager: AuthManager
     private let onReceive: @Sendable (DropPayload) async -> Bool
     private let onPairSuccess: @Sendable (PairedDevice) -> Void
     private let onStatusChange: @Sendable (UInt16?, String?) -> Void
 
+    private let lock = NSLock()
+    private var group: MultiThreadedEventLoopGroup?
+    private var serverChannel: Channel?
+    private var netService: NetService?
+
     init(
         preferredPort: UInt16 = 51234,
-        tlsIdentity: SecIdentity,
+        sslContext: NIOSSLContext,
         shortFingerprint: String,
         authManager: AuthManager,
         onStatusChange: @escaping @Sendable (UInt16?, String?) -> Void,
         onPairSuccess: @escaping @Sendable (PairedDevice) -> Void,
         onReceive: @escaping @Sendable (DropPayload) async -> Bool
     ) {
-        self.preferredPort = preferredPort
-        self.tlsIdentity = tlsIdentity
+        self.preferredPort = Int(preferredPort)
+        self.sslContext = sslContext
         self.shortFingerprint = shortFingerprint
         self.authManager = authManager
         self.onStatusChange = onStatusChange
@@ -39,256 +43,206 @@ final class DropServer: @unchecked Sendable {
 
     func start() {
         stop()
-        startListener(port: NWEndpoint.Port(rawValue: preferredPort))
+
+        let elg = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        lock.lock()
+        self.group = elg
+        lock.unlock()
+
+        let sslContext = self.sslContext
+        let shortFingerprint = self.shortFingerprint
+        let authManager = self.authManager
+        let onPairSuccess = self.onPairSuccess
+        let onReceive = self.onReceive
+
+        let bootstrap = ServerBootstrap(group: elg)
+            .serverChannelOption(ChannelOptions.backlog, value: 128)
+            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                let actualPort = UInt16(channel.localAddress?.port ?? self.preferredPort)
+                return channel.pipeline.configureDeskDropPipeline(
+                    sslContext: sslContext,
+                    port: actualPort,
+                    shortFingerprint: shortFingerprint,
+                    authManager: authManager,
+                    onPairSuccess: onPairSuccess,
+                    onReceive: onReceive
+                )
+            }
+            .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 16)
+
+        bindWithFallback(bootstrap: bootstrap, group: elg, port: preferredPort)
+    }
+
+    private func bindWithFallback(bootstrap: ServerBootstrap, group: MultiThreadedEventLoopGroup, port: Int) {
+        bootstrap.bind(host: "0.0.0.0", port: port).whenComplete { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let channel):
+                let actualPort = UInt16(channel.localAddress?.port ?? port)
+                self.lock.lock()
+                self.serverChannel = channel
+                self.lock.unlock()
+                self.publishBonjour(port: Int32(actualPort))
+                self.onStatusChange(actualPort, nil)
+
+            case .failure(let error):
+                if port != 0 {
+                    self.bindWithFallback(bootstrap: bootstrap, group: group, port: 0)
+                } else {
+                    self.onStatusChange(nil, error.localizedDescription)
+                }
+            }
+        }
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
-        for session in activeSessions.values {
-            session.forceClose()
+        lock.lock()
+        let ch = serverChannel
+        let elg = group
+        let svc = netService
+        serverChannel = nil
+        group = nil
+        netService = nil
+        lock.unlock()
+
+        if let svc {
+            DispatchQueue.main.async {
+                svc.stop()
+            }
         }
-        activeSessions.removeAll()
+        try? ch?.close().wait()
+        try? elg?.syncShutdownGracefully()
         onStatusChange(nil, nil)
     }
 
-    private func startListener(port: NWEndpoint.Port?) {
-        do {
-            let tlsOptions = NWProtocolTLS.Options()
-            if let secId = sec_identity_create(tlsIdentity) {
-                sec_protocol_options_set_local_identity(tlsOptions.securityProtocolOptions, secId)
-            }
-            sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-
-            let params = NWParameters(tls: tlsOptions)
-            params.allowLocalEndpointReuse = true
-
-            let nwListener = try NWListener(using: params, on: port ?? .any)
-            let deviceName = Host.current().localizedName ?? "Mac"
-            nwListener.service = NWListener.Service(name: deviceName, type: "_deskdrop._tcp")
-
-            nwListener.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
-                switch state {
-                case .ready:
-                    let actualPort = nwListener.port?.rawValue
-                    self.onStatusChange(actualPort, nil)
-                case .failed(let error):
-                    if port != nil {
-                        nwListener.cancel()
-                        self.startListener(port: nil)
-                    } else {
-                        self.onStatusChange(nil, error.localizedDescription)
-                    }
-                case .cancelled:
-                    self.onStatusChange(nil, nil)
-                default:
-                    break
-                }
-            }
-
-            nwListener.newConnectionHandler = { [weak self] connection in
-                self?.handleConnection(connection)
-            }
-
-            self.listener = nwListener
-            nwListener.start(queue: queue)
-        } catch {
-            onStatusChange(nil, error.localizedDescription)
+    private func publishBonjour(port: Int32) {
+        let name = Host.current().localizedName ?? "Mac"
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let service = NetService(domain: "local.", type: "_deskdrop._tcp.", name: name, port: port)
+            service.publish()
+            self.lock.lock()
+            self.netService = service
+            self.lock.unlock()
         }
-    }
-
-    private func handleConnection(_ connection: NWConnection) {
-        connection.start(queue: queue)
-        let session = HTTPConnectionSession(
-            connection: connection,
-            portProvider: { [weak self] in self?.listener?.port?.rawValue ?? self?.preferredPort ?? 51234 },
-            shortFingerprint: shortFingerprint,
-            authManager: authManager,
-            onPairSuccess: onPairSuccess,
-            onReceive: onReceive
-        )
-        let id = ObjectIdentifier(session)
-        activeSessions[id] = session
-        session.onClose = { [weak self] in
-            self?.activeSessions.removeValue(forKey: id)
-        }
-        session.start()
     }
 }
 
-private final class HTTPConnectionSession: @unchecked Sendable {
-    var onClose: (() -> Void)?
+private final class DeskDropHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
 
-    private let connection: NWConnection
-    private let portProvider: () -> UInt16
+    private let port: UInt16
     private let shortFingerprint: String
     private let authManager: AuthManager
     private let onPairSuccess: @Sendable (PairedDevice) -> Void
     private let onReceive: @Sendable (DropPayload) async -> Bool
 
-    private var buffer = Data()
-    private var headersParsed = false
-    private var method = ""
-    private var path = ""
-    private var headers: [String: String] = [:]
-    private var contentLength = 0
-    private var bodyStartIndex = 0
-    private var handled = false
-
+    private var requestHead: HTTPRequestHead?
+    private var bodyData = Data()
     private static let maxBodyBytes = 250 * 1024 * 1024 // 250 MB
 
     init(
-        connection: NWConnection,
-        portProvider: @escaping () -> UInt16,
+        port: UInt16,
         shortFingerprint: String,
         authManager: AuthManager,
         onPairSuccess: @escaping @Sendable (PairedDevice) -> Void,
         onReceive: @escaping @Sendable (DropPayload) async -> Bool
     ) {
-        self.connection = connection
-        self.portProvider = portProvider
+        self.port = port
         self.shortFingerprint = shortFingerprint
         self.authManager = authManager
         self.onPairSuccess = onPairSuccess
         self.onReceive = onReceive
     }
 
-    func start() {
-        receiveNextChunk()
-    }
-
-    private func receiveNextChunk() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self, !self.handled else { return }
-
-            if let data, !data.isEmpty {
-                self.buffer.append(data)
-            }
-
-            if !self.headersParsed {
-                if let range = self.buffer.range(of: Data("\r\n\r\n".utf8)) {
-                    self.bodyStartIndex = range.upperBound
-                    let headerData = self.buffer.subdata(in: 0..<range.lowerBound)
-                    guard self.parseHeaders(headerData) else {
-                        self.sendResponse(status: "400 Bad Request", body: #"{"error":"Invalid HTTP request"}"#)
-                        return
-                    }
-                    self.headersParsed = true
-
-                    if self.contentLength > Self.maxBodyBytes {
-                        self.sendResponse(status: "413 Payload Too Large", body: #"{"error":"Payload too large"}"#)
-                        return
-                    }
-
-                    if self.headers["expect"]?.lowercased() == "100-continue" {
-                        self.connection.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
-                    }
-                }
-            }
-
-            if self.headersParsed {
-                let receivedBodyCount = self.buffer.count - self.bodyStartIndex
-                if receivedBodyCount >= self.contentLength {
-                    self.handled = true
-                    let bodyEnd = self.bodyStartIndex + self.contentLength
-                    let bodyData = self.buffer.subdata(in: self.bodyStartIndex..<bodyEnd)
-                    self.processRequest(body: bodyData)
-                    return
-                }
-            }
-
-            if error != nil || isComplete {
-                self.handled = true
-                if self.headersParsed && self.contentLength == 0 {
-                    self.processRequest(body: Data())
-                } else {
-                    self.close()
-                }
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let part = unwrapInboundIn(data)
+        switch part {
+        case .head(let head):
+            requestHead = head
+            bodyData.removeAll(keepingCapacity: true)
+        case .body(var buffer):
+            if bodyData.count + buffer.readableBytes > Self.maxBodyBytes {
+                sendJSON(context: context, status: .payloadTooLarge, body: #"{"error":"Payload too large"}"#)
+                requestHead = nil
+                bodyData.removeAll()
                 return
             }
-
-            self.receiveNextChunk()
+            if let bytes = buffer.readBytes(length: buffer.readableBytes) {
+                bodyData.append(contentsOf: bytes)
+            }
+        case .end:
+            guard let head = requestHead else { return }
+            let payload = bodyData
+            requestHead = nil
+            bodyData.removeAll()
+            handleRequest(context: context, head: head, body: payload)
         }
     }
 
-    private func parseHeaders(_ data: Data) -> Bool {
-        guard let raw = String(data: data, encoding: .utf8) else { return false }
-        let lines = raw.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return false }
-        let parts = requestLine.split(separator: " ", maxSplits: 2)
-        guard parts.count >= 2 else { return false }
-
-        method = String(parts[0]).uppercased()
-        path = String(parts[1]).components(separatedBy: "?").first ?? String(parts[1])
-
-        for line in lines.dropFirst() {
-            guard let colon = line.firstIndex(of: ":") else { continue }
-            let key = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
-            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-            headers[key] = value
-        }
-
-        contentLength = Int(headers["content-length"] ?? "0") ?? 0
-        return true
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
     }
 
-    private func processRequest(body: Data) {
+    private func handleRequest(context: ChannelHandlerContext, head: HTTPRequestHead, body: Data) {
+        let method = head.method.rawValue.uppercased()
+        let path = head.uri.components(separatedBy: "?").first ?? head.uri
         let deviceName = Host.current().localizedName ?? "Mac"
         let escapedMacName = jsonEscape(deviceName)
 
-        // Public discovery metadata (does not accept drops or expose secrets)
         if method == "GET" && path == "/info" {
             let pairingActive = authManager.currentPairingSession() != nil
-            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(portProvider()),"fp":"\#(shortFingerprint)","pairing":\#(pairingActive),"tls":true}"#
-            sendResponse(status: "200 OK", body: json)
+            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(port),"fp":"\#(shortFingerprint)","pairing":\#(pairingActive),"tls":true}"#
+            sendJSON(context: context, status: .ok, body: json)
             return
         }
 
-        // One-time pairing endpoint (only open during 60s pairing window)
         if method == "POST" && path == "/pair" {
             guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let code = obj["code"] as? String else {
-                sendResponse(status: "400 Bad Request", body: #"{"error":"Missing pairing code"}"#)
+                sendJSON(context: context, status: .badRequest, body: #"{"error":"Missing pairing code"}"#)
                 return
             }
             let phoneName = (obj["deviceName"] as? String) ?? "Android Phone"
             switch authManager.completePairing(code: code, deviceName: phoneName) {
             case .notInPairingMode:
-                sendResponse(status: "403 Forbidden", body: #"{"error":"Mac is not in pairing mode"}"#)
+                sendJSON(context: context, status: .forbidden, body: #"{"error":"Mac is not in pairing mode"}"#)
             case .invalidCode(let remaining):
-                sendResponse(status: "401 Unauthorized", body: #"{"error":"Invalid pairing code","remaining":\#(remaining)}"#)
+                sendJSON(context: context, status: .unauthorized, body: #"{"error":"Invalid pairing code","remaining":\#(remaining)}"#)
             case .success(let device):
                 onPairSuccess(device)
                 let escapedToken = jsonEscape(device.tokenHex)
                 let escapedId = jsonEscape(device.id)
                 let json = #"{"deviceId":"\#(escapedId)","token":"\#(escapedToken)","name":"\#(escapedMacName)"}"#
-                sendResponse(status: "200 OK", body: json)
+                sendJSON(context: context, status: .ok, body: json)
             }
             return
         }
 
-        // All remaining endpoints require paired HMAC-SHA256 authentication
         guard let sender = authManager.verifyRequest(
             method: method,
             path: path,
-            deviceId: headers["x-deskdrop-device"],
-            timestampHeader: headers["x-deskdrop-timestamp"],
-            nonce: headers["x-deskdrop-nonce"],
-            signatureHex: headers["x-deskdrop-sig"]
+            deviceId: head.headers.first(name: "x-deskdrop-device"),
+            timestampHeader: head.headers.first(name: "x-deskdrop-timestamp"),
+            nonce: head.headers.first(name: "x-deskdrop-nonce"),
+            signatureHex: head.headers.first(name: "x-deskdrop-sig")
         ) else {
-            sendResponse(status: "401 Unauthorized", body: #"{"error":"Unauthorized"}"#)
+            sendJSON(context: context, status: .unauthorized, body: #"{"error":"Unauthorized"}"#)
             return
         }
 
         switch (method, path) {
         case ("GET", "/ping"):
-            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(portProvider()),"tls":true,"version":"2.0.0"}"#
-            sendResponse(status: "200 OK", body: json)
+            let json = #"{"app":"DeskDrop","name":"\#(escapedMacName)","port":\#(port),"tls":true,"version":"2.0.0"}"#
+            sendJSON(context: context, status: .ok, body: json)
 
         case ("POST", "/drop/text"):
+            let contentType = head.headers.first(name: "content-type")?.lowercased() ?? ""
             let text: String?
-            if headers["content-type"]?.lowercased().contains("application/json") == true,
+            if contentType.contains("application/json"),
                let jsonObj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                let extracted = jsonObj["text"] as? String {
                 text = extracted
@@ -297,37 +251,46 @@ private final class HTTPConnectionSession: @unchecked Sendable {
             }
 
             guard let text, !text.isEmpty else {
-                sendResponse(status: "400 Bad Request", body: #"{"error":"Empty text payload"}"#)
+                sendJSON(context: context, status: .badRequest, body: #"{"error":"Empty text payload"}"#)
                 return
             }
 
+            let eventLoop = context.eventLoop
+            let channel = context.channel
             Task {
                 let ok = await onReceive(.text(text, senderName: sender.name))
-                if ok {
-                    sendResponse(status: "200 OK", body: #"{"ok":true,"kind":"text"}"#)
-                } else {
-                    sendResponse(status: "500 Internal Server Error", body: #"{"ok":false}"#)
+                eventLoop.execute {
+                    self.sendJSONOnChannel(
+                        channel: channel,
+                        status: ok ? .ok : .internalServerError,
+                        body: ok ? #"{"ok":true,"kind":"text"}"# : #"{"ok":false}"#
+                    )
                 }
             }
 
         case ("POST", "/drop/file"):
             guard !body.isEmpty else {
-                sendResponse(status: "400 Bad Request", body: #"{"error":"Empty file payload"}"#)
+                sendJSON(context: context, status: .badRequest, body: #"{"error":"Empty file payload"}"#)
                 return
             }
-            let rawName = headers["x-filename"]?.removingPercentEncoding
-            let mimeType = headers["content-type"]
+            let rawName = head.headers.first(name: "x-filename")?.removingPercentEncoding
+            let mimeType = head.headers.first(name: "content-type")
+
+            let eventLoop = context.eventLoop
+            let channel = context.channel
             Task {
                 let ok = await onReceive(.file(data: body, filename: rawName, mimeType: mimeType, senderName: sender.name))
-                if ok {
-                    sendResponse(status: "200 OK", body: #"{"ok":true,"kind":"file"}"#)
-                } else {
-                    sendResponse(status: "500 Internal Server Error", body: #"{"ok":false}"#)
+                eventLoop.execute {
+                    self.sendJSONOnChannel(
+                        channel: channel,
+                        status: ok ? .ok : .internalServerError,
+                        body: ok ? #"{"ok":true,"kind":"file"}"# : #"{"ok":false}"#
+                    )
                 }
             }
 
         default:
-            sendResponse(status: "404 Not Found", body: #"{"error":"Not found"}"#)
+            sendJSON(context: context, status: .notFound, body: #"{"error":"Not found"}"#)
         }
     }
 
@@ -336,34 +299,69 @@ private final class HTTPConnectionSession: @unchecked Sendable {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    private func sendResponse(status: String, body: String) {
-        let bodyData = Data(body.utf8)
-        let header = [
-            "HTTP/1.1 \(status)",
-            "Content-Type: application/json; charset=utf-8",
-            "Content-Length: \(bodyData.count)",
-            "Connection: close",
-            "",
-            ""
-        ].joined(separator: "\r\n")
+    private func sendJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, body: String) {
+        var headers = HTTPHeaders()
+        headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
+        headers.add(name: "Content-Length", value: "\(body.utf8.count)")
+        headers.add(name: "Connection", value: "close")
 
-        var packet = Data(header.utf8)
-        packet.append(bodyData)
+        let head = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
+        context.write(wrapOutboundOut(.head(head)), promise: nil)
 
-        connection.send(content: packet, completion: .contentProcessed { [weak self] _ in
-            self?.close()
-        })
+        var buf = context.channel.allocator.buffer(capacity: body.utf8.count)
+        buf.writeString(body)
+        context.write(wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
+
+        context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
+            context.close(promise: nil)
+        }
     }
 
-    func forceClose() {
-        handled = true
-        close()
-    }
+    private func sendJSONOnChannel(channel: Channel, status: HTTPResponseStatus, body: String) {
+        var headers = HTTPHeaders()
+        headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
+        headers.add(name: "Content-Length", value: "\(body.utf8.count)")
+        headers.add(name: "Connection", value: "close")
 
-    private func close() {
-        connection.cancel()
-        let callback = onClose
-        onClose = nil
-        callback?()
+        let head = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+
+        var buf = channel.allocator.buffer(capacity: body.utf8.count)
+        buf.writeString(body)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)), promise: nil)
+
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in
+            channel.close(promise: nil)
+        }
+    }
+}
+
+private extension ChannelPipeline {
+    func configureDeskDropPipeline(
+        sslContext: NIOSSLContext,
+        port: UInt16,
+        shortFingerprint: String,
+        authManager: AuthManager,
+        onPairSuccess: @escaping @Sendable (PairedDevice) -> Void,
+        onReceive: @escaping @Sendable (DropPayload) async -> Bool
+    ) -> EventLoopFuture<Void> {
+        let sync = self.syncOperations
+        return self.eventLoop.submit {
+            try sync.addHandler(NIOSSLServerHandler(context: sslContext))
+        }.flatMap {
+            self.configureHTTPServerPipeline()
+        }.flatMap {
+            self.eventLoop.submit {
+                try sync.addHandler(
+                    DeskDropHTTPHandler(
+                        port: port,
+                        shortFingerprint: shortFingerprint,
+                        authManager: authManager,
+                        onPairSuccess: onPairSuccess,
+                        onReceive: onReceive
+                    )
+                )
+            }
+        }
     }
 }

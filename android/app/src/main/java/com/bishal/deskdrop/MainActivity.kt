@@ -58,6 +58,14 @@ class MainActivity : AppCompatActivity() {
         refreshUiState()
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshUiState()
+        if (DeskDropPrefs.getPairedMac(this) != null) {
+            verifyPairedConnection(showToast = false)
+        }
+    }
+
     private fun refreshUiState() {
         val paired = DeskDropPrefs.getPairedMac(this)
         if (paired != null) {
@@ -195,15 +203,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun testPairedPing() {
-        pairedStatusText.text = "Testing encrypted connection..."
+        verifyPairedConnection(showToast = true)
+    }
+
+    private fun verifyPairedConnection(showToast: Boolean) {
+        pairedStatusText.text = "Checking connection..."
         executor.execute {
-            val verified = DeskDropClient.resolvePairedMac(this)
-            runOnUiThread {
-                if (verified != null) {
-                    pairedStatusText.text = "${verified.name} (${verified.host}:${verified.port}) • Online"
-                    Toast.makeText(this, "Verified ${verified.name}!", Toast.LENGTH_SHORT).show()
-                } else {
-                    pairedStatusText.text = "Mac offline, locked, or unreachable on Wi-Fi"
+            when (val status = DeskDropClient.resolvePairedMacStatus(this)) {
+                is MacCheckResult.Online -> runOnUiThread {
+                    pairedStatusText.text = "${status.mac.name} (${status.mac.host}:${status.mac.port}) • Online"
+                    if (showToast) {
+                        Toast.makeText(this, "Verified ${status.mac.name}!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                MacCheckResult.Revoked -> runOnUiThread {
+                    discoveredMac = null
+                    pairStatusText.text = "Device was revoked on Mac. Pair again."
+                    refreshUiState()
+                    Toast.makeText(this, "Revoked on Mac", Toast.LENGTH_SHORT).show()
+                }
+                MacCheckResult.Unreachable -> runOnUiThread {
+                    val saved = DeskDropPrefs.getPairedMac(this)
+                    if (saved != null) {
+                        pairedStatusText.text = "${saved.name} (${saved.host}:${saved.port}) • Offline/Locked"
+                    }
                 }
             }
         }
@@ -225,20 +248,27 @@ class MainActivity : AppCompatActivity() {
         }
 
         executor.execute {
-            val target = DeskDropClient.resolvePairedMac(this)
-            if (target == null) {
-                runOnUiThread {
-                    Toast.makeText(this, "Mac offline or unreachable", Toast.LENGTH_SHORT).show()
+            when (val status = DeskDropClient.resolvePairedMacStatus(this)) {
+                is MacCheckResult.Online -> {
+                    val result = DeskDropClient.sendText(this, status.mac, text)
+                    runOnUiThread {
+                        result.onSuccess {
+                            quickTextInput.setText("")
+                            Toast.makeText(this, "Sent encrypted to ${status.mac.name}!", Toast.LENGTH_SHORT).show()
+                        }.onFailure { err ->
+                            Toast.makeText(this, "Failed: ${err.message}", Toast.LENGTH_SHORT).show()
+                            refreshUiState()
+                        }
+                    }
                 }
-                return@execute
-            }
-            val result = DeskDropClient.sendText(target, text)
-            runOnUiThread {
-                result.onSuccess {
-                    quickTextInput.setText("")
-                    Toast.makeText(this, "Sent encrypted to ${target.name}!", Toast.LENGTH_SHORT).show()
-                }.onFailure { err ->
-                    Toast.makeText(this, "Failed: ${err.message}", Toast.LENGTH_SHORT).show()
+                MacCheckResult.Revoked -> runOnUiThread {
+                    discoveredMac = null
+                    pairStatusText.text = "Device was revoked on Mac. Pair again."
+                    refreshUiState()
+                    Toast.makeText(this, "Revoked on Mac", Toast.LENGTH_SHORT).show()
+                }
+                MacCheckResult.Unreachable -> runOnUiThread {
+                    Toast.makeText(this, "Mac offline or unreachable", Toast.LENGTH_SHORT).show()
                 }
             }
         }

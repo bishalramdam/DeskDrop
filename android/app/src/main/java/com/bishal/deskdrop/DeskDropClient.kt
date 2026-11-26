@@ -36,6 +36,12 @@ data class DiscoveredMac(
     val pairingActive: Boolean
 )
 
+sealed class MacCheckResult {
+    data class Online(val mac: PairedMac) : MacCheckResult()
+    data object Revoked : MacCheckResult()
+    data object Unreachable : MacCheckResult()
+}
+
 object DeskDropClient {
     private const val SERVICE_TYPE = "_deskdrop._tcp."
     private val secureRandom = SecureRandom()
@@ -134,7 +140,7 @@ object DeskDropClient {
         }
     }
 
-    fun pingPairedMac(mac: PairedMac, timeoutMs: Int = 900): PairedMac? {
+    fun pingPairedMacStatus(mac: PairedMac, timeoutMs: Int = 900): MacCheckResult {
         return try {
             val path = "/ping"
             val url = URL("https://${mac.host}:${mac.port}$path")
@@ -143,21 +149,28 @@ object DeskDropClient {
                 applyHmacAuth(this, mac, "GET", path)
             }
             try {
-                if (conn.responseCode == 200) {
-                    val body = conn.inputStream.bufferedReader().readText()
-                    val json = JSONObject(body)
-                    if (json.optString("app") == "DeskDrop") {
-                        mac.copy(
-                            port = json.optInt("port", mac.port),
-                            name = json.optString("name", mac.name)
-                        )
-                    } else null
-                } else null
+                val code = conn.responseCode
+                when {
+                    code == 200 -> {
+                        val body = conn.inputStream.bufferedReader().readText()
+                        val json = JSONObject(body)
+                        if (json.optString("app") == "DeskDrop") {
+                            MacCheckResult.Online(
+                                mac.copy(
+                                    port = json.optInt("port", mac.port),
+                                    name = json.optString("name", mac.name)
+                                )
+                            )
+                        } else MacCheckResult.Unreachable
+                    }
+                    code == 401 -> MacCheckResult.Revoked
+                    else -> MacCheckResult.Unreachable
+                }
             } finally {
                 conn.disconnect()
             }
         } catch (_: Exception) {
-            null
+            MacCheckResult.Unreachable
         }
     }
 
@@ -219,20 +232,36 @@ object DeskDropClient {
         }
     }
 
-    fun resolvePairedMac(context: Context): PairedMac? {
-        val saved = DeskDropPrefs.getPairedMac(context) ?: return null
-        pingPairedMac(saved, timeoutMs = 600)?.let { verified ->
-            DeskDropPrefs.savePairedMac(context, verified)
-            return verified
+    fun resolvePairedMacStatus(context: Context): MacCheckResult {
+        val saved = DeskDropPrefs.getPairedMac(context) ?: return MacCheckResult.Unreachable
+        when (val first = pingPairedMacStatus(saved, timeoutMs = 600)) {
+            is MacCheckResult.Online -> {
+                DeskDropPrefs.savePairedMac(context, first.mac)
+                return first
+            }
+            MacCheckResult.Revoked -> {
+                DeskDropPrefs.clearPairedMac(context)
+                return MacCheckResult.Revoked
+            }
+            MacCheckResult.Unreachable -> {}
         }
-        val (newHost, newPort) = discoverEndpointOnWifi(context) ?: return null
+
+        val (newHost, newPort) = discoverEndpointOnWifi(context) ?: return MacCheckResult.Unreachable
         val candidate = saved.copy(host = newHost, port = newPort)
-        val verified = pingPairedMac(candidate, timeoutMs = 900) ?: return null
-        DeskDropPrefs.savePairedMac(context, verified)
-        return verified
+        return when (val second = pingPairedMacStatus(candidate, timeoutMs = 900)) {
+            is MacCheckResult.Online -> {
+                DeskDropPrefs.savePairedMac(context, second.mac)
+                second
+            }
+            MacCheckResult.Revoked -> {
+                DeskDropPrefs.clearPairedMac(context)
+                MacCheckResult.Revoked
+            }
+            MacCheckResult.Unreachable -> MacCheckResult.Unreachable
+        }
     }
 
-    fun sendText(mac: PairedMac, text: String): Result<Unit> {
+    fun sendText(context: Context, mac: PairedMac, text: String): Result<Unit> {
         return try {
             val path = "/drop/text"
             val payload = text.toByteArray(Charsets.UTF_8)
@@ -250,6 +279,7 @@ object DeskDropClient {
                 if (code in 200..299) {
                     Result.success(Unit)
                 } else {
+                    if (code == 401) DeskDropPrefs.clearPairedMac(context)
                     Result.failure(RuntimeException(httpErrorMessage(code, conn)))
                 }
             } finally {
@@ -298,6 +328,7 @@ object DeskDropClient {
                 if (code in 200..299) {
                     Result.success(filename)
                 } else {
+                    if (code == 401) DeskDropPrefs.clearPairedMac(context)
                     Result.failure(RuntimeException(httpErrorMessage(code, conn)))
                 }
             } finally {
