@@ -49,10 +49,23 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Build Debug APK
+      - name: Build Signed Release APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          gradle -p android assembleDebug
-          cp android/app/build/outputs/apk/debug/app-debug.apk DeskDrop-android.apk
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/deskdrop-release.jks
+            export ANDROID_KEYSTORE_PATH=/tmp/deskdrop-release.jks
+            gradle -p android assembleRelease
+            cp android/app/build/outputs/apk/release/app-release.apk DeskDrop-android.apk
+            rm -f /tmp/deskdrop-release.jks
+          else
+            gradle -p android assembleDebug
+            cp android/app/build/outputs/apk/debug/app-debug.apk DeskDrop-android.apk
+          fi
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
@@ -92,8 +105,8 @@ jobs:
             - **Native Mac integration:** Auto-copies screenshots, images, and text to your clipboard, saves files to `~/Library/Application Support/DeskDrop/Received/`, and delivers native macOS notifications with **Copy**, **Copy Path**, and **Show in Finder** actions.
 
             ### Downloads
-            - `DeskDrop-macOS.zip` — Unzip and move `DeskDrop.app` into `~/Applications/` or `/Applications/`.
-            - `DeskDrop-android.apk` — Install on Android 8.0+ (API 26+).
+            - `DeskDrop-macOS.zip` — Unzip, move `DeskDrop.app` into `~/Applications/`, and if macOS Gatekeeper blocks it on first launch, run `xattr -cr ~/Applications/DeskDrop.app`.
+            - `DeskDrop-android.apk` — Signed Release APK for Android 8.0+ (API 26+). *(If you previously installed a local debug build, uninstall it once before installing this release build.)*
           files: |
             DeskDrop-macOS.zip
             DeskDrop-android.apk
