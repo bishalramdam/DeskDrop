@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "Building DeskDrop (release)..."
-swift build -c release --disable-sandbox
+swift build -c release --disable-sandbox --disable-automatic-resolution
 
 APP_DIR="$SCRIPT_DIR/build/DeskDrop.app"
 CONTENTS_DIR="$APP_DIR/Contents"
