@@ -165,10 +165,14 @@ struct MenuBarView: View {
                                 .controlSize(.mini)
                             }
                         } else {
-                            Text("Enable Location Services for DeskDrop to read Wi-Fi name")
+                            Text("Enable Location to verify Wi-Fi")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                             Spacer()
+                            Button("Settings") {
+                                store.openLocationSettings()
+                            }
+                            .controlSize(.mini)
                             Button("Refresh") {
                                 store.wifiMonitor.requestLocationAccessIfNeeded()
                                 store.wifiMonitor.refreshSSID()

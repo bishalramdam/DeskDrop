@@ -4,19 +4,25 @@ import Foundation
 import Network
 
 @MainActor
-final class WiFiMonitor: NSObject, ObservableObject, CLLocationManagerDelegate {
+final class WiFiMonitor: NSObject, ObservableObject, CLLocationManagerDelegate, CWEventDelegate {
     @Published private(set) var currentSSID: String?
     @Published private(set) var isOnWiFi: Bool = true
     @Published private(set) var locationAuthorized: Bool = false
 
     private let locationManager = CLLocationManager()
+    private let wifiClient = CWWiFiClient.shared()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let monitorQueue = DispatchQueue(label: "com.bishal.DeskDrop.wifiMonitor")
+    private var retryTask: Task<Void, Never>?
     var onNetworkChange: (() -> Void)?
 
     override init() {
         super.init()
         locationManager.delegate = self
+        wifiClient.delegate = self
+        try? wifiClient.startMonitoringEvent(with: .ssidDidChange)
+        try? wifiClient.startMonitoringEvent(with: .linkDidChange)
+
         updateAuthorizationState()
         refreshSSID()
 
@@ -27,6 +33,9 @@ final class WiFiMonitor: NSObject, ObservableObject, CLLocationManagerDelegate {
                 self.isOnWiFi = wifiUp
                 self.refreshSSID()
                 self.onNetworkChange?()
+                if wifiUp && self.currentSSID == nil {
+                    self.scheduleSSIDRetry()
+                }
             }
         }
         pathMonitor.start(queue: monitorQueue)
@@ -34,6 +43,7 @@ final class WiFiMonitor: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     deinit {
         pathMonitor.cancel()
+        try? wifiClient.stopMonitoringAllEvents()
     }
 
     func requestLocationAccessIfNeeded() {
@@ -45,7 +55,36 @@ final class WiFiMonitor: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func refreshSSID() {
         updateAuthorizationState()
-        currentSSID = CWWiFiClient.shared().interface()?.ssid()
+        currentSSID = wifiClient.interface()?.ssid()
+    }
+
+    private func scheduleSSIDRetry() {
+        retryTask?.cancel()
+        retryTask = Task { @MainActor [weak self] in
+            for delaySec in [1, 2, 3] {
+                try? await Task.sleep(nanoseconds: UInt64(delaySec) * 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.refreshSSID()
+                if self.currentSSID != nil {
+                    self.onNetworkChange?()
+                    return
+                }
+            }
+        }
+    }
+
+    nonisolated func ssidDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            self?.refreshSSID()
+            self?.onNetworkChange?()
+        }
+    }
+
+    nonisolated func linkDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            self?.refreshSSID()
+            self?.onNetworkChange?()
+        }
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

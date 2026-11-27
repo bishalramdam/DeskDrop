@@ -41,8 +41,14 @@ final class DropServer: @unchecked Sendable {
         self.onReceive = onReceive
     }
 
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return serverChannel != nil
+    }
+
     func start() {
-        stop()
+        teardown(notify: false)
 
         let elg = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         lock.lock()
@@ -98,6 +104,10 @@ final class DropServer: @unchecked Sendable {
     }
 
     func stop() {
+        teardown(notify: true)
+    }
+
+    private func teardown(notify: Bool) {
         lock.lock()
         let ch = serverChannel
         let elg = group
@@ -114,7 +124,9 @@ final class DropServer: @unchecked Sendable {
         }
         try? ch?.close().wait()
         try? elg?.syncShutdownGracefully()
-        onStatusChange(nil, nil)
+        if notify {
+            onStatusChange(nil, nil)
+        }
     }
 
     private func publishBonjour(port: Int32) {

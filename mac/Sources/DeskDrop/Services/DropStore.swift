@@ -50,8 +50,10 @@ final class DropStore: NSObject, ObservableObject {
     private var pairingTimerTask: Task<Void, Never>?
 
     private var manuallyStopped = false
+    private var manualStartOverride = false
     private var isScreenLocked = false
     private var isSleeping = false
+    private var lastObservedSSID: String?
 
     private static let notificationCategoryId = "DESKDROP_ITEM"
     private static let actionCopy = "ACTION_COPY"
@@ -88,22 +90,35 @@ final class DropStore: NSObject, ObservableObject {
         wifiMonitor.onNetworkChange = { [weak self] in
             guard let self else { return }
             self.localIP = NetworkUtils.localIPv4Addresses().first
+            if self.wifiMonitor.currentSSID != self.lastObservedSSID {
+                self.lastObservedSSID = self.wifiMonitor.currentSSID
+                self.manualStartOverride = false
+            }
             self.evaluateLifecycle()
             if self.isListening {
                 self.server?.republishBonjour()
             }
         }
         self.localIP = NetworkUtils.localIPv4Addresses().first
+        self.lastObservedSSID = wifiMonitor.currentSSID
         evaluateLifecycle()
     }
 
     func toggleListening() {
         if isListening {
             manuallyStopped = true
+            manualStartOverride = false
             stopServer(reason: "Stopped manually")
         } else {
             manuallyStopped = false
+            manualStartOverride = true
             startServerIfPossible()
+        }
+    }
+
+    func openLocationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -220,11 +235,16 @@ final class DropStore: NSObject, ObservableObject {
             stopServer(reason: "Stopped manually")
             return
         }
+
+        let liveLocked = Self.queryScreenLocked() ?? isScreenLocked
+        isScreenLocked = liveLocked
+
         if pauseOnLockSleep && (isScreenLocked || isSleeping) {
+            manualStartOverride = false
             stopServer(reason: "Paused (Mac locked/asleep)")
             return
         }
-        if trustedWiFiOnly {
+        if trustedWiFiOnly && !manualStartOverride {
             wifiMonitor.refreshSSID()
             if !wifiMonitor.isOnWiFi {
                 stopServer(reason: "Paused (Wi-Fi disconnected)")
@@ -239,9 +259,22 @@ final class DropStore: NSObject, ObservableObject {
                 return
             }
         }
-        if !isListening {
+        if !isListening || server?.isRunning != true {
             startServerIfPossible()
         }
+    }
+
+    private static func queryScreenLocked() -> Bool? {
+        guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+            return nil
+        }
+        if let locked = dict["CGSSessionScreenIsLocked"] as? Bool {
+            return locked
+        }
+        if let lockedNum = dict["CGSSessionScreenIsLocked"] as? NSNumber {
+            return lockedNum.boolValue
+        }
+        return false
     }
 
     private func startServerIfPossible() {
