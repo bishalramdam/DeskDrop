@@ -121,12 +121,26 @@ final class DropServer: @unchecked Sendable {
         let name = Host.current().localizedName ?? "Mac"
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.lock.lock()
+            let existing = self.netService
+            self.netService = nil
+            self.lock.unlock()
+            existing?.stop()
+
             let service = NetService(domain: "local.", type: "_deskdrop._tcp.", name: name, port: port)
             service.publish()
             self.lock.lock()
             self.netService = service
             self.lock.unlock()
         }
+    }
+
+    func republishBonjour() {
+        lock.lock()
+        let port = serverChannel?.localAddress?.port
+        lock.unlock()
+        guard let port else { return }
+        publishBonjour(port: Int32(port))
     }
 }
 

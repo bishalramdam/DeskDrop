@@ -1,6 +1,8 @@
 package com.bishal.deskdrop
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -10,14 +12,19 @@ import android.provider.OpenableColumns
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -120,7 +127,8 @@ object DeskDropClient {
                         name = obj.optString("name", "Mac"),
                         certFingerprint = expectedFingerprint.lowercase(),
                         deviceId = obj.getString("deviceId"),
-                        tokenHex = obj.getString("token")
+                        tokenHex = obj.getString("token"),
+                        knownEndpoints = listOf("$host:$port")
                     )
                     DeskDropPrefs.savePairedMac(context, paired)
                     Result.success(paired)
@@ -140,11 +148,11 @@ object DeskDropClient {
         }
     }
 
-    fun pingPairedMacStatus(mac: PairedMac, timeoutMs: Int = 900): MacCheckResult {
+    fun pingPairedMacStatus(mac: PairedMac, timeoutMs: Int = 800): MacCheckResult {
         return try {
             val path = "/ping"
             val url = URL("https://${mac.host}:${mac.port}$path")
-            val conn = openPinnedConnection(url, mac.certFingerprint, timeoutMs = timeoutMs).apply {
+            val conn = openPinnedConnection(url, mac.certFingerprint, timeoutMs = timeoutMs, readTimeoutMs = timeoutMs).apply {
                 requestMethod = "GET"
                 applyHmacAuth(this, mac, "GET", path)
             }
@@ -174,8 +182,28 @@ object DeskDropClient {
         }
     }
 
+    fun updateEndpointAndPing(context: Context, host: String, port: Int): MacCheckResult {
+        val saved = DeskDropPrefs.getPairedMac(context) ?: return MacCheckResult.Unreachable
+        val candidate = saved.copy(host = host.trim(), port = port)
+        return when (val res = pingPairedMacStatus(candidate, timeoutMs = 1500)) {
+            is MacCheckResult.Online -> {
+                DeskDropPrefs.savePairedMac(context, res.mac)
+                res
+            }
+            MacCheckResult.Revoked -> {
+                DeskDropPrefs.clearPairedMac(context)
+                MacCheckResult.Revoked
+            }
+            MacCheckResult.Unreachable -> MacCheckResult.Unreachable
+        }
+    }
+
+    fun discoverEndpointOnWifi(context: Context, timeoutMs: Long = 2200): Pair<String, Int>? {
+        return discoverAllEndpointsOnWifi(context, timeoutMs).firstOrNull()
+    }
+
     @Suppress("DEPRECATION")
-    fun discoverEndpointOnWifi(context: Context, timeoutMs: Long = 2800): Pair<String, Int>? {
+    fun discoverAllEndpointsOnWifi(context: Context, timeoutMs: Long = 2200): List<Pair<String, Int>> {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val multicastLock = wifi?.createMulticastLock("DeskDropNsdLock")?.apply {
             setReferenceCounted(false)
@@ -183,46 +211,82 @@ object DeskDropClient {
         }
 
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
-        val found = AtomicReference<Pair<String, Int>?>(null)
-        val latch = CountDownLatch(1)
-        val stopped = AtomicReference(false)
+        val results = Collections.synchronizedList(mutableListOf<Pair<String, Int>>())
+        val firstFoundLatch = CountDownLatch(1)
+        val callbacks = mutableListOf<NsdManager.ServiceInfoCallback>()
 
         val discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(regType: String) {}
             override fun onDiscoveryStopped(serviceType: String) {}
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                latch.countDown()
+                firstFoundLatch.countDown()
             }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                if (found.get() != null) return
-                nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
-                    override fun onServiceResolved(resolved: NsdServiceInfo) {
-                        val hostAddr = resolved.host?.let { addr ->
-                            if (addr is Inet4Address) addr.hostAddress else addr.hostAddress
-                        } ?: return
-                        if (found.compareAndSet(null, hostAddr to resolved.port)) {
-                            latch.countDown()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val cb = object : NsdManager.ServiceInfoCallback {
+                        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {}
+                        override fun onServiceLost() {}
+                        override fun onServiceInfoCallbackUnregistered() {}
+                        override fun onServiceUpdated(updated: NsdServiceInfo) {
+                            val ipv4 = updated.hostAddresses.firstOrNull { it is Inet4Address }?.hostAddress
+                            if (ipv4 != null && updated.port > 0) {
+                                val ep = ipv4 to updated.port
+                                if (!results.contains(ep)) {
+                                    results.add(ep)
+                                }
+                                firstFoundLatch.countDown()
+                            }
                         }
                     }
-                })
+                    synchronized(callbacks) { callbacks.add(cb) }
+                    try {
+                        nsdManager.registerServiceInfoCallback(serviceInfo, Executors.newSingleThreadExecutor(), cb)
+                    } catch (_: Exception) {
+                    }
+                } else {
+                    nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
+                        override fun onServiceResolved(resolved: NsdServiceInfo) {
+                            val host = resolved.host
+                            val ipv4 = if (host is Inet4Address) host.hostAddress else null
+                            if (ipv4 != null && resolved.port > 0) {
+                                val ep = ipv4 to resolved.port
+                                if (!results.contains(ep)) {
+                                    results.add(ep)
+                                }
+                                firstFoundLatch.countDown()
+                            }
+                        }
+                    })
+                }
             }
         }
 
         return try {
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-            latch.await(timeoutMs, TimeUnit.MILLISECONDS)
-            found.get()
+            // Wait up to timeoutMs; if at least one appears early, wait briefly for additional Macs
+            if (firstFoundLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && results.isNotEmpty()) {
+                Thread.sleep(250)
+            }
+            results.toList()
         } catch (_: Exception) {
-            null
+            results.toList()
         } finally {
-            if (stopped.compareAndSet(false, true)) {
-                try {
-                    nsdManager.stopServiceDiscovery(discoveryListener)
-                } catch (_: Exception) {
+            try {
+                nsdManager.stopServiceDiscovery(discoveryListener)
+            } catch (_: Exception) {
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                synchronized(callbacks) {
+                    for (cb in callbacks) {
+                        try {
+                            nsdManager.unregisterServiceInfoCallback(cb)
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
             }
             try {
@@ -232,33 +296,149 @@ object DeskDropClient {
         }
     }
 
+    fun scanSubnetForEndpoints(context: Context, port: Int, timeoutMs: Int = 240): List<Pair<String, Int>> {
+        val localIp = getActiveWifiIPv4(context) ?: return emptyList()
+        val parts = localIp.split(".")
+        if (parts.size != 4) return emptyList()
+        val prefix = "${parts[0]}.${parts[1]}.${parts[2]}"
+
+        val pool = Executors.newFixedThreadPool(48)
+        val openHosts = Collections.synchronizedList(mutableListOf<Pair<String, Int>>())
+        val latch = CountDownLatch(254)
+
+        for (i in 1..254) {
+            val candidateIp = "$prefix.$i"
+            if (candidateIp == localIp) {
+                latch.countDown()
+                continue
+            }
+            pool.execute {
+                try {
+                    Socket().use { socket ->
+                        socket.connect(InetSocketAddress(candidateIp, port), timeoutMs)
+                        openHosts.add(candidateIp to port)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        try {
+            latch.await(3200, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+        } finally {
+            pool.shutdownNow()
+        }
+        return openHosts.toList()
+    }
+
+    private fun getActiveWifiIPv4(context: Context): String? {
+        return try {
+            val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return null
+            val network = cm.activeNetwork ?: return null
+            val caps = cm.getNetworkCapabilities(network) ?: return null
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return null
+            val lp = cm.getLinkProperties(network) ?: return null
+            lp.linkAddresses
+                .map { it.address }
+                .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+                ?.hostAddress
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun probeCandidatesInParallel(
+        context: Context,
+        saved: PairedMac,
+        candidates: List<Pair<String, Int>>,
+        timeoutMs: Int
+    ): MacCheckResult {
+        if (candidates.isEmpty()) return MacCheckResult.Unreachable
+
+        val pool = Executors.newFixedThreadPool(minOf(candidates.size, 8))
+        val winner = AtomicReference<PairedMac?>(null)
+        val sawRevoked = AtomicBoolean(false)
+        val latch = CountDownLatch(candidates.size)
+
+        for ((host, port) in candidates) {
+            pool.execute {
+                try {
+                    if (winner.get() != null) return@execute
+                    val candidate = saved.copy(host = host, port = port)
+                    when (val res = pingPairedMacStatus(candidate, timeoutMs = timeoutMs)) {
+                        is MacCheckResult.Online -> {
+                            winner.compareAndSet(null, res.mac)
+                        }
+                        MacCheckResult.Revoked -> {
+                            sawRevoked.set(true)
+                        }
+                        MacCheckResult.Unreachable -> {}
+                    }
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        try {
+            latch.await((timeoutMs + 400).toLong(), TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+        } finally {
+            pool.shutdownNow()
+        }
+
+        winner.get()?.let { verified ->
+            DeskDropPrefs.savePairedMac(context, verified)
+            return MacCheckResult.Online(verified)
+        }
+        if (sawRevoked.get()) {
+            DeskDropPrefs.clearPairedMac(context)
+            return MacCheckResult.Revoked
+        }
+        return MacCheckResult.Unreachable
+    }
+
     fun resolvePairedMacStatus(context: Context): MacCheckResult {
         val saved = DeskDropPrefs.getPairedMac(context) ?: return MacCheckResult.Unreachable
-        when (val first = pingPairedMacStatus(saved, timeoutMs = 600)) {
-            is MacCheckResult.Online -> {
-                DeskDropPrefs.savePairedMac(context, first.mac)
-                return first
+
+        // 1. Fast path: check active IP + all remembered IPs (Home, Office, etc.) in parallel
+        val knownPairs = saved.knownEndpoints.mapNotNull { ep ->
+            val idx = ep.lastIndexOf(':')
+            if (idx <= 0) null
+            else {
+                val h = ep.substring(0, idx)
+                val p = ep.substring(idx + 1).toIntOrNull()
+                if (h.isNotBlank() && p != null) h to p else null
             }
-            MacCheckResult.Revoked -> {
-                DeskDropPrefs.clearPairedMac(context)
-                return MacCheckResult.Revoked
-            }
+        }.ifEmpty { listOf(saved.host to saved.port) }
+
+        when (val cachedRes = probeCandidatesInParallel(context, saved, knownPairs, timeoutMs = 650)) {
+            is MacCheckResult.Online, MacCheckResult.Revoked -> return cachedRes
             MacCheckResult.Unreachable -> {}
         }
 
-        val (newHost, newPort) = discoverEndpointOnWifi(context) ?: return MacCheckResult.Unreachable
-        val candidate = saved.copy(host = newHost, port = newPort)
-        return when (val second = pingPairedMacStatus(candidate, timeoutMs = 900)) {
-            is MacCheckResult.Online -> {
-                DeskDropPrefs.savePairedMac(context, second.mac)
-                second
+        // 2. Bonjour/mDNS discovery across ALL DeskDrop Macs on current Wi-Fi
+        val mDnsCandidates = discoverAllEndpointsOnWifi(context, timeoutMs = 2000)
+            .filterNot { knownPairs.contains(it) }
+        if (mDnsCandidates.isNotEmpty()) {
+            when (val mDnsRes = probeCandidatesInParallel(context, saved, mDnsCandidates, timeoutMs = 900)) {
+                is MacCheckResult.Online, MacCheckResult.Revoked -> return mDnsRes
+                MacCheckResult.Unreachable -> {}
             }
-            MacCheckResult.Revoked -> {
-                DeskDropPrefs.clearPairedMac(context)
-                MacCheckResult.Revoked
-            }
-            MacCheckResult.Unreachable -> MacCheckResult.Unreachable
         }
+
+        // 3. Fallback: fast /24 subnet probe on Wi-Fi (works even when Office Wi-Fi blocks mDNS multicast)
+        val subnetCandidates = scanSubnetForEndpoints(context, saved.port, timeoutMs = 240)
+            .filterNot { knownPairs.contains(it) || mDnsCandidates.contains(it) }
+        if (subnetCandidates.isNotEmpty()) {
+            return probeCandidatesInParallel(context, saved, subnetCandidates, timeoutMs = 1000)
+        }
+
+        return MacCheckResult.Unreachable
     }
 
     fun sendText(context: Context, mac: PairedMac, text: String): Result<Unit> {

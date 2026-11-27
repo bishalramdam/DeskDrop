@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var hostInput: EditText
     private lateinit var portInput: EditText
     private lateinit var codeInput: EditText
+    private lateinit var pairedHostInput: EditText
     private lateinit var quickTextInput: EditText
 
     private var discoveredMac: DiscoveredMac? = null
@@ -46,11 +47,13 @@ class MainActivity : AppCompatActivity() {
         hostInput = findViewById(R.id.hostInput)
         portInput = findViewById(R.id.portInput)
         codeInput = findViewById(R.id.codeInput)
+        pairedHostInput = findViewById(R.id.pairedHostInput)
         quickTextInput = findViewById(R.id.quickTextInput)
 
         findViewById<Button>(R.id.scanQrButton).setOnClickListener { startQrScan() }
         findViewById<Button>(R.id.findMacButton).setOnClickListener { findMac() }
         findViewById<Button>(R.id.pairCodeButton).setOnClickListener { pairWithCode() }
+        findViewById<Button>(R.id.updateIpButton).setOnClickListener { updatePairedIp() }
         findViewById<Button>(R.id.pingButton).setOnClickListener { testPairedPing() }
         findViewById<Button>(R.id.unpairButton).setOnClickListener { unpairMac() }
         findViewById<Button>(R.id.sendTextButton).setOnClickListener { sendQuickText() }
@@ -73,6 +76,9 @@ class MainActivity : AppCompatActivity() {
             unpairedCard.visibility = View.GONE
             quickTextCard.visibility = View.VISIBLE
             pairedStatusText.text = "${paired.name} (${paired.host}:${paired.port})"
+            if (pairedHostInput.text.isNullOrBlank()) {
+                pairedHostInput.setText(paired.host)
+            }
             val shortFp = paired.certFingerprint.take(12).uppercase().chunked(4).joinToString(":")
             pairedCertText.text = "TLS Cert: $shortFp • HMAC Auth"
         } else {
@@ -202,15 +208,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updatePairedIp() {
+        val raw = pairedHostInput.text.toString().trim()
+        val saved = DeskDropPrefs.getPairedMac(this) ?: return
+        if (raw.isEmpty()) {
+            Toast.makeText(this, "Enter Mac IP address", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val host: String
+        val port: Int
+        if (raw.contains(":")) {
+            host = raw.substringBefore(":").trim()
+            port = raw.substringAfter(":").trim().toIntOrNull() ?: saved.port
+        } else {
+            host = raw
+            port = saved.port
+        }
+
+        pairedStatusText.text = "Connecting to $host:$port..."
+        executor.execute {
+            when (val status = DeskDropClient.updateEndpointAndPing(this, host, port)) {
+                is MacCheckResult.Online -> runOnUiThread {
+                    pairedHostInput.setText(status.mac.host)
+                    pairedStatusText.text = "${status.mac.name} (${status.mac.host}:${status.mac.port}) • Online"
+                    Toast.makeText(this, "Connected to ${status.mac.name}!", Toast.LENGTH_SHORT).show()
+                }
+                MacCheckResult.Revoked -> runOnUiThread {
+                    discoveredMac = null
+                    pairStatusText.text = "Device was revoked on Mac. Pair again."
+                    refreshUiState()
+                    Toast.makeText(this, "Revoked on Mac", Toast.LENGTH_SHORT).show()
+                }
+                MacCheckResult.Unreachable -> runOnUiThread {
+                    pairedStatusText.text = "${saved.name} • Not reachable at $host:$port"
+                    Toast.makeText(this, "Could not reach Mac at $host:$port", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     private fun testPairedPing() {
         verifyPairedConnection(showToast = true)
     }
 
     private fun verifyPairedConnection(showToast: Boolean) {
-        pairedStatusText.text = "Checking connection..."
+        pairedStatusText.text = "Finding Mac on Wi-Fi..."
         executor.execute {
             when (val status = DeskDropClient.resolvePairedMacStatus(this)) {
                 is MacCheckResult.Online -> runOnUiThread {
+                    pairedHostInput.setText(status.mac.host)
                     pairedStatusText.text = "${status.mac.name} (${status.mac.host}:${status.mac.port}) • Online"
                     if (showToast) {
                         Toast.makeText(this, "Verified ${status.mac.name}!", Toast.LENGTH_SHORT).show()
@@ -225,7 +271,7 @@ class MainActivity : AppCompatActivity() {
                 MacCheckResult.Unreachable -> runOnUiThread {
                     val saved = DeskDropPrefs.getPairedMac(this)
                     if (saved != null) {
-                        pairedStatusText.text = "${saved.name} (${saved.host}:${saved.port}) • Offline/Locked"
+                        pairedStatusText.text = "${saved.name} (${saved.host}:${saved.port}) • Offline / New IP"
                     }
                 }
             }
@@ -235,6 +281,7 @@ class MainActivity : AppCompatActivity() {
     private fun unpairMac() {
         DeskDropPrefs.clearPairedMac(this)
         discoveredMac = null
+        pairedHostInput.setText("")
         pairStatusText.text = "Unpaired. Click Pair on Mac to link again."
         refreshUiState()
         Toast.makeText(this, "Unpaired", Toast.LENGTH_SHORT).show()

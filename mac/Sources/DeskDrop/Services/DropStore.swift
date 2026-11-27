@@ -6,6 +6,7 @@ import UserNotifications
 final class DropStore: NSObject, ObservableObject {
     @Published var items: [DropItem] = []
     @Published var listeningPort: UInt16?
+    @Published var localIP: String?
     @Published var serverError: String?
     @Published var isListening = false
     @Published var statusNote: String?
@@ -85,8 +86,14 @@ final class DropStore: NSObject, ObservableObject {
         configureNotifications()
         observeLockAndSleep()
         wifiMonitor.onNetworkChange = { [weak self] in
-            self?.evaluateLifecycle()
+            guard let self else { return }
+            self.localIP = NetworkUtils.localIPv4Addresses().first
+            self.evaluateLifecycle()
+            if self.isListening {
+                self.server?.republishBonjour()
+            }
         }
+        self.localIP = NetworkUtils.localIPv4Addresses().first
         evaluateLifecycle()
     }
 
@@ -252,6 +259,7 @@ final class DropStore: NSObject, ObservableObject {
                 onStatusChange: { [weak self] port, error in
                     Task { @MainActor [weak self] in
                         self?.listeningPort = port
+                        self?.localIP = NetworkUtils.localIPv4Addresses().first
                         self?.serverError = error
                         if let code = self?.activePairingCode {
                             self?.updatePairingQR(code: code)

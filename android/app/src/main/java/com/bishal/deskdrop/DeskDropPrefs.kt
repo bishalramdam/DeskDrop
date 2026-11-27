@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -17,7 +18,8 @@ data class PairedMac(
     val name: String,
     val certFingerprint: String,
     val deviceId: String,
-    val tokenHex: String
+    val tokenHex: String,
+    val knownEndpoints: List<String> = emptyList()
 )
 
 object DeskDropPrefs {
@@ -32,13 +34,30 @@ object DeskDropPrefs {
         return try {
             val jsonStr = decrypt(encoded)
             val obj = JSONObject(jsonStr)
+            val host = obj.getString("host")
+            val port = obj.getInt("port")
+            val endpoints = mutableListOf<String>()
+            val arr = obj.optJSONArray("endpoints")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val ep = arr.optString(i).trim()
+                    if (ep.isNotEmpty() && !endpoints.contains(ep)) {
+                        endpoints.add(ep)
+                    }
+                }
+            }
+            val primary = "$host:$port"
+            if (!endpoints.contains(primary)) {
+                endpoints.add(0, primary)
+            }
             PairedMac(
-                host = obj.getString("host"),
-                port = obj.getInt("port"),
+                host = host,
+                port = port,
                 name = obj.optString("name", "Mac"),
                 certFingerprint = obj.getString("fp"),
                 deviceId = obj.getString("deviceId"),
-                tokenHex = obj.getString("tokenHex")
+                tokenHex = obj.getString("tokenHex"),
+                knownEndpoints = endpoints
             )
         } catch (_: Exception) {
             null
@@ -46,13 +65,25 @@ object DeskDropPrefs {
     }
 
     fun savePairedMac(context: Context, mac: PairedMac) {
+        val cleanHost = mac.host.trim()
+        val primary = "$cleanHost:${mac.port}"
+        val merged = mutableListOf(primary)
+        for (ep in mac.knownEndpoints) {
+            val cleanEp = ep.trim()
+            if (cleanEp.isNotEmpty() && !merged.contains(cleanEp)) {
+                merged.add(cleanEp)
+            }
+            if (merged.size >= 10) break
+        }
+
         val obj = JSONObject().apply {
-            put("host", mac.host.trim())
+            put("host", cleanHost)
             put("port", mac.port)
             put("name", mac.name)
             put("fp", mac.certFingerprint.lowercase())
             put("deviceId", mac.deviceId)
             put("tokenHex", mac.tokenHex)
+            put("endpoints", JSONArray(merged))
         }
         val encrypted = encrypt(obj.toString())
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

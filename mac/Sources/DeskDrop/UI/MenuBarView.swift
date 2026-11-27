@@ -51,8 +51,8 @@ struct MenuBarView: View {
                     if !store.isListening {
                         Text(store.statusNote ?? "Stopped")
                     } else if let port = store.listeningPort {
-                        let ips = NetworkUtils.localIPv4Addresses()
-                        let addressText = ips.first.map { "\($0):\(port)" } ?? "localhost:\(port)"
+                        let ip = store.localIP ?? NetworkUtils.localIPv4Addresses().first
+                        let addressText = ip.map { "\($0):\(port)" } ?? "localhost:\(port)"
                         Text("HTTPS • \(addressText)")
                             .textSelection(.enabled)
                     } else if let error = store.serverError {
