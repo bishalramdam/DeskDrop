@@ -17,10 +17,25 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp ".build/release/DeskDrop" "$MACOS_DIR/DeskDrop"
 cp "Info.plist" "$CONTENTS_DIR/Info.plist"
-if [ ! -f "Resources/AppIcon.icns" ]; then
-    swift "scripts/generate_icon.swift" "Resources/AppIcon.icns"
+if [ ! -f "Resources/AppIcon.icns" ] || [ ! -f "Resources/Assets.car" ]; then
+    TMP_XCASSETS="/tmp/DeskDrop_Assets_$$.xcassets"
+    rm -rf "$TMP_XCASSETS"
+    swift "scripts/generate_icon.swift" "Resources/AppIcon.icns" "" "$TMP_XCASSETS"
+    if command -v actool >/dev/null 2>&1; then
+        actool "$TMP_XCASSETS" \
+            --compile "Resources" \
+            --app-icon AppIcon \
+            --output-partial-info-plist "/tmp/DeskDrop_partial_$$.plist" \
+            --platform macosx \
+            --minimum-deployment-target 13.0 >/dev/null 2>&1 || true
+        rm -f "/tmp/DeskDrop_partial_$$.plist"
+    fi
+    rm -rf "$TMP_XCASSETS"
 fi
 cp "Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+if [ -f "Resources/Assets.car" ]; then
+    cp "Resources/Assets.car" "$RESOURCES_DIR/Assets.car"
+fi
 
 # Ad-hoc sign so macOS local network & notification permissions behave consistently
 codesign --force --deep --sign - "$APP_DIR"

@@ -336,7 +336,8 @@ final class DropStore: NSObject, ObservableObject {
             if autoCopyToClipboard {
                 ClipboardManager.copyText(text)
             }
-            recordItem(item, notificationTitle: "Text from \(senderName)", notificationBody: preview)
+            let subtitle = autoCopyToClipboard ? "Copied to clipboard" : "Received"
+            recordItem(item, notificationTitle: "Text from \(senderName)", notificationSubtitle: subtitle, notificationBody: preview)
             return true
 
         case .file(let data, let filename, let mimeType, let senderName):
@@ -361,9 +362,9 @@ final class DropStore: NSObject, ObservableObject {
                     }
                 }
                 let notifTitle = isImage ? "Image from \(senderName)" : "File from \(senderName)"
-                let notifBody = "\(savedURL.lastPathComponent) (\(item.formattedSize))" +
-                    (autoCopyToClipboard ? " • Copied" : "")
-                recordItem(item, notificationTitle: notifTitle, notificationBody: notifBody)
+                let notifSubtitle = autoCopyToClipboard ? "Copied to clipboard" : "Saved to Received"
+                let notifBody = "\(savedURL.lastPathComponent) (\(item.formattedSize))"
+                recordItem(item, notificationTitle: notifTitle, notificationSubtitle: notifSubtitle, notificationBody: notifBody)
                 return true
             } catch {
                 return false
@@ -371,13 +372,13 @@ final class DropStore: NSObject, ObservableObject {
         }
     }
 
-    private func recordItem(_ item: DropItem, notificationTitle: String, notificationBody: String) {
+    private func recordItem(_ item: DropItem, notificationTitle: String, notificationSubtitle: String, notificationBody: String) {
         items.insert(item, at: 0)
         if items.count > 30 {
             items = Array(items.prefix(30))
         }
         storage.saveHistory(items)
-        postNotification(item: item, title: notificationTitle, body: notificationBody)
+        postNotification(item: item, title: notificationTitle, subtitle: notificationSubtitle, body: notificationBody)
     }
 
     private func configureNotifications() {
@@ -398,10 +399,11 @@ final class DropStore: NSObject, ObservableObject {
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    private func postNotification(item: DropItem, title: String, body: String) {
+    private func postNotification(item: DropItem, title: String, subtitle: String, body: String) {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = title
+        content.subtitle = subtitle
         content.body = body
         content.sound = .default
         content.categoryIdentifier = Self.notificationCategoryId

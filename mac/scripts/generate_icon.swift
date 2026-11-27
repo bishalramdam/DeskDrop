@@ -3,12 +3,13 @@ import Foundation
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    fputs("Usage: generate_icon.swift <output_icns_path> [preview_png_path]\n", stderr)
+    fputs("Usage: generate_icon.swift <output_icns_path> [preview_png_path] [xcassets_dir]\n", stderr)
     exit(1)
 }
 
 let outputURL = URL(fileURLWithPath: args[1])
-let previewURL = args.count >= 3 ? URL(fileURLWithPath: args[2]) : nil
+let previewURL = args.count >= 3 && !args[2].isEmpty ? URL(fileURLWithPath: args[2]) : nil
+let xcassetsURL = args.count >= 4 ? URL(fileURLWithPath: args[3], isDirectory: true) : nil
 try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
 func renderIcon(pixelSize: Int) -> Data? {
@@ -204,17 +205,24 @@ func appendUInt32BE(_ data: inout Data, _ value: UInt32) {
 
 let chunks: [(String, Int)] = [
     ("icp4", 16),
+    ("ic11", 32),
     ("icp5", 32),
+    ("ic12", 64),
     ("icp6", 64),
     ("ic07", 128),
+    ("ic13", 256),
     ("ic08", 256),
+    ("ic14", 512),
     ("ic09", 512),
     ("ic10", 1024)
 ]
 
+var pngCache: [Int: Data] = [:]
 var body = Data()
 for (osType, px) in chunks {
-    guard let png = renderIcon(pixelSize: px) else { continue }
+    let png = pngCache[px] ?? renderIcon(pixelSize: px)
+    guard let png else { continue }
+    pngCache[px] = png
     body.append(Data(osType.utf8))
     appendUInt32BE(&body, UInt32(8 + png.count))
     body.append(png)
@@ -228,3 +236,43 @@ appendUInt32BE(&icns, UInt32(8 + body.count))
 icns.append(body)
 
 try icns.write(to: outputURL, options: .atomic)
+
+if let xcassetsURL {
+    let iconsetDir = xcassetsURL.appendingPathComponent("AppIcon.appiconset", isDirectory: true)
+    try FileManager.default.createDirectory(at: iconsetDir, withIntermediateDirectories: true)
+    let mappings: [(String, Int)] = [
+        ("icon_16x16.png", 16),
+        ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32),
+        ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128),
+        ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256),
+        ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512),
+        ("icon_512x512@2x.png", 1024)
+    ]
+    for (name, px) in mappings {
+        if let png = pngCache[px] ?? renderIcon(pixelSize: px) {
+            try png.write(to: iconsetDir.appendingPathComponent(name), options: .atomic)
+        }
+    }
+    let contentsJson = """
+    {
+      "images" : [
+        { "idiom" : "mac", "scale" : "1x", "size" : "16x16", "filename" : "icon_16x16.png" },
+        { "idiom" : "mac", "scale" : "2x", "size" : "16x16", "filename" : "icon_16x16@2x.png" },
+        { "idiom" : "mac", "scale" : "1x", "size" : "32x32", "filename" : "icon_32x32.png" },
+        { "idiom" : "mac", "scale" : "2x", "size" : "32x32", "filename" : "icon_32x32@2x.png" },
+        { "idiom" : "mac", "scale" : "1x", "size" : "128x128", "filename" : "icon_128x128.png" },
+        { "idiom" : "mac", "scale" : "2x", "size" : "128x128", "filename" : "icon_128x128@2x.png" },
+        { "idiom" : "mac", "scale" : "1x", "size" : "256x256", "filename" : "icon_256x256.png" },
+        { "idiom" : "mac", "scale" : "2x", "size" : "256x256", "filename" : "icon_256x256@2x.png" },
+        { "idiom" : "mac", "scale" : "1x", "size" : "512x512", "filename" : "icon_512x512.png" },
+        { "idiom" : "mac", "scale" : "2x", "size" : "512x512", "filename" : "icon_512x512@2x.png" }
+      ],
+      "info" : { "author" : "xcode", "version" : 1 }
+    }
+    """
+    try contentsJson.data(using: .utf8)?.write(to: iconsetDir.appendingPathComponent("Contents.json"), options: .atomic)
+}
